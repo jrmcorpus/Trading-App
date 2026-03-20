@@ -1,0 +1,180 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  @apply box-border;
+}
+
+html,
+body {
+  @apply m-0 h-full w-full overflow-hidden bg-slate-950 p-0;
+  max-height: 100vh;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overscroll-behavior: none;
+}
+
+#root {
+  @apply h-full w-full overflow-hidden;
+  max-height: 100vh;
+}
+
+/* Premium Scrollbar Styling */
+::-webkit-scrollbar {
+  @apply w-2 h-2;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-slate-900;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-slate-700 rounded-full hover:bg-slate-600 transition-colors;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-slate-500;
+}
+
+/* Form Elements */
+input[type="number"],
+input[type="text"],
+input[type="email"],
+input[type="password"],
+textarea,
+select {
+  @apply w-full px-4 py-2.5 rounded-lg bg-slate-800 border border-slate-700 text-white placeholder-slate-500 transition-all duration-200;
+  @apply focus:outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-400/20;
+}
+
+input[type="number"]:focus,
+input[type="text"]:focus,
+input[type="email"]:focus,
+textarea:focus,
+select:focus {
+  @apply bg-slate-700 border-emerald-400;
+}
+
+/* Range Slider */
+input[type="range"] {
+  @apply w-full cursor-pointer accent-emerald-400;
+}
+
+/* Button Styles */
+button {
+  @apply transition-all duration-200 font-medium;
+}
+
+button:active:not(:disabled) {
+  @apply scale-95;
+}
+
+button:disabled {
+  @apply opacity-50 cursor-not-allowed;
+}
+
+/* Primary Button */
+.btn-primary {
+  @apply px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg font-semibold;
+}
+
+/* Secondary Button */
+.btn-secondary {
+  @apply px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg font-semibold;
+}
+
+/* Cards */
+.card {
+  @apply rounded-xl border border-slate-700/50 bg-slate-800/50 backdrop-blur-sm p-6;
+}
+
+.card-hover {
+  @apply transition-all duration-200 hover:border-slate-600 hover:bg-slate-700/50;
+}
+
+/* Tables */
+table {
+  @apply w-full border-collapse;
+}
+
+th {
+  @apply px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-slate-400 bg-slate-800 border-b border-slate-700;
+}
+
+td {
+  @apply px-4 py-3 border-b border-slate-700/50 text-slate-200;
+}
+
+tr:hover {
+  @apply bg-slate-800/50;
+}
+
+/* Badges */
+.badge {
+  @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold;
+}
+
+.badge-success {
+  @apply bg-emerald-400/10 text-emerald-400;
+}
+
+.badge-danger {
+  @apply bg-rose-400/10 text-rose-400;
+}
+
+.badge-warning {
+  @apply bg-amber-400/10 text-amber-400;
+}
+
+.badge-info {
+  @apply bg-blue-400/10 text-blue-400;
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(0.5rem);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.3s ease-in-out;
+}
+
+.animate-slide-in {
+  animation: slideIn 0.3s ease-in-out;
+}
+
+/* Table row hover */
+tbody tr {
+  @apply transition-colors;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .sidebar {
+    @apply fixed left-0 top-0 h-full z-50;
+  }
+
+  main {
+    @apply ml-0;
+  }
+}
