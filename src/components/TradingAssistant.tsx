@@ -14,6 +14,7 @@ import {
   classifyAdaptiveSession,
   formatAdaptiveSessionLabel,
 } from "../utils/assistantLearning";
+import { getGlobalDeduplicator } from "../utils/orderDeduplication";
 import PriceChart from "./PriceChart";
 
 interface PriceData {
@@ -32,6 +33,9 @@ interface PriceData {
   atr: number;
   movingAverage50: number;
   movingAverage200: number;
+  movingAverage200Prev?: number;
+  movingAverage200Slope?: number;
+  movingAverage200SlopeAtrRatio?: number;
   lastCandleTime: number;
 }
 
@@ -59,7 +63,9 @@ type OrderAction = "PLACE" | "CLOSE" | "MODIFY";
 type AutoEntryMode = "MARKET" | "LIMIT_SR";
 type AutoEntryTiming = "M15" | "M5" | "M1";
 type AutoStrategyMode = "CLASSIC_STACK" | "SCALP_M15";
+type AutoReentryMode = "OFF" | "BALANCED" | "STRICT";
 type AutoRuntimeMode = "BROWSER" | "HEADLESS";
+type AutoSideFilter = "BOTH" | "BUY_ONLY" | "SELL_ONLY";
 type AutoTradeLogLevel = "INFO" | "WARN" | "ERROR";
 type WatchlistBoardAssetType = "CRYPTO" | "FOREX" | "METAL" | "INDEX";
 type WatchlistBoardTypeFilter = "ALL" | WatchlistBoardAssetType;
@@ -67,6 +73,7 @@ type BotExecutionStage =
   | "PREPARE_SENT"
   | "PREPARE_OK"
   | "PREPARE_FAIL"
+  | "DUPLICATE_BLOCKED"
   | "CONFIRM_SENT"
   | "EXECUTION_OK"
   | "EXECUTION_FAIL";
@@ -486,26 +493,29 @@ const requestBridgeAiCompletion = async (
 };
 
 const AUTO_TRADE_DEFAULTS = {
-  minConfidence: "80",
-  minWinRate: "70",
-  minRR: "1.8",
+  sideFilter: "BOTH" as AutoSideFilter,
+  minConfidence: "70",
+  minWinRate: "65",
+  minRR: "1.0",
+  maxSpreadPoints: "80",
   cooldownMin: "15",
-  maxOpenTrades: "1",
+  maxOpenTrades: "2",
   requireStrong: true,
   enforceTrendStack: true,
   enforceSymbolCooldown: true,
-  enforceDailyLossLimit: false,
+  enforceDailyLossLimit: true,
   enforceHardRiskBlock: true,
   strategyMode: "CLASSIC_STACK" as AutoStrategyMode,
   scalpAggressive: true,
   biasTimeframe: "H4" as ChartTimeframe,
   setupTimeframe: "H1" as ChartTimeframe,
   entryTimeframe: "M5" as AutoEntryTiming,
+  reentryMode: "BALANCED" as AutoReentryMode,
   timeframeOverride: "PANEL" as ChartTimeframe | "PANEL",
   entryMode: "MARKET" as AutoEntryMode,
-  allowMarketFallback: true,
-  fallbackMinConfidence: "82",
-  fallbackRrBuffer: "0.35",
+  allowMarketFallback: false,
+  fallbackMinConfidence: "70",
+  fallbackRrBuffer: "0.2",
   botLots: "0.10",
   riskMode: "USD" as "PCT" | "USD",
   useDynamicLot: true,
@@ -545,8 +555,11 @@ const HEADLESS_GOLD_PRESET_SYMBOL = "GOLD";
 const HEADLESS_GOLD_PRESET_TIMEFRAME: ChartTimeframe = "M5";
 const HEADLESS_GOLD_PRESET_COMMENT = "gold-overnight-scalp";
 const HEADLESS_OVERNIGHT_BREAK_EVEN_PROFIT_USD = "0.30";
-const HEADLESS_OVERNIGHT_TARGET_PROFIT_USD = "1.10";
-const HEADLESS_OVERNIGHT_LOSS_USD = "1.20";
+const HEADLESS_OVERNIGHT_TARGET_PROFIT_USD = "1.50";
+const HEADLESS_OVERNIGHT_LOSS_USD = "1.50";
+const HEADLESS_BIAS_FLIP_TP_PROGRESS_PCT = "35";
+const HEADLESS_OVERNIGHT_RETRACE_ARM_USD = "0.80";
+const HEADLESS_OVERNIGHT_RETRACE_CLOSE_USD = "0.40";
 const HEADLESS_MA200_FLAT_MAX_ATR_RATIO = 0.09;
 const HEADLESS_HIGH_IMPACT_NEWS_LOOKBACK_MIN = 360;
 const HEADLESS_HIGH_IMPACT_NEWS_KEYWORDS = ["NFP", "CPI", "FOMC"];
@@ -680,6 +693,10 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     confirmToken: string;
     summary: string;
     expiresInMs: number;
+    action: string;
+    symbol: string;
+    side?: string;
+    price?: number;
   } | null>(null);
   const [tradeBridgeBusy, setTradeBridgeBusy] = useState(false);
   const [tradeBridgeMessage, setTradeBridgeMessage] = useState<string>("");
@@ -696,9 +713,13 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   const [aiPositionsProvider, setAiPositionsProvider] = useState<"GEMINI" | "OPENAI" | "">("");
   const [autoRuntimeMode, setAutoRuntimeMode] = useState<AutoRuntimeMode>("BROWSER");
   const [autoTradeEnabled, setAutoTradeEnabled] = useState(false);
+  const [autoSideFilter, setAutoSideFilter] = useState<AutoSideFilter>(AUTO_TRADE_DEFAULTS.sideFilter);
   const [autoMinConfidence, setAutoMinConfidence] = useState(AUTO_TRADE_DEFAULTS.minConfidence);
   const [autoMinWinRate, setAutoMinWinRate] = useState(AUTO_TRADE_DEFAULTS.minWinRate);
   const [autoMinRR, setAutoMinRR] = useState(AUTO_TRADE_DEFAULTS.minRR);
+  const [autoMaxSpreadPointsSetting, setAutoMaxSpreadPointsSetting] = useState(
+    AUTO_TRADE_DEFAULTS.maxSpreadPoints
+  );
   const [autoCooldownMin, setAutoCooldownMin] = useState(AUTO_TRADE_DEFAULTS.cooldownMin);
   const [autoMaxOpenTrades, setAutoMaxOpenTrades] = useState(AUTO_TRADE_DEFAULTS.maxOpenTrades);
   const [autoRequireStrongSignal, setAutoRequireStrongSignal] = useState(AUTO_TRADE_DEFAULTS.requireStrong);
@@ -712,6 +733,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     parseBooleanFlag(import.meta.env.VITE_AUTO_SESSION_WINDOW_ENABLED as string | undefined, false)
   );
   const [autoEntryTimeframe, setAutoEntryTimeframe] = useState<AutoEntryTiming>(AUTO_TRADE_DEFAULTS.entryTimeframe);
+  const [autoReentryMode, setAutoReentryMode] = useState<AutoReentryMode>(AUTO_TRADE_DEFAULTS.reentryMode);
   const [autoTradeTimeframeOverride, setAutoTradeTimeframeOverride] =
     useState<ChartTimeframe | "PANEL">(AUTO_TRADE_DEFAULTS.timeframeOverride);
   const [autoEntryMode, setAutoEntryMode] = useState<AutoEntryMode>(AUTO_TRADE_DEFAULTS.entryMode);
@@ -730,9 +752,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   const [autoDynamicLotStep, setAutoDynamicLotStep] = useState(AUTO_TRADE_DEFAULTS.lotStep);
   const [accountProfile, setAccountProfile] = useState<"STANDARD" | "MICRO">("MICRO");
   const [autoTradeDraft, setAutoTradeDraft] = useState({
+    sideFilter: AUTO_TRADE_DEFAULTS.sideFilter,
     minConfidence: AUTO_TRADE_DEFAULTS.minConfidence,
     minWinRate: AUTO_TRADE_DEFAULTS.minWinRate,
     minRR: AUTO_TRADE_DEFAULTS.minRR,
+    maxSpreadPoints: AUTO_TRADE_DEFAULTS.maxSpreadPoints,
     cooldownMin: AUTO_TRADE_DEFAULTS.cooldownMin,
     maxOpenTrades: AUTO_TRADE_DEFAULTS.maxOpenTrades,
     requireStrong: AUTO_TRADE_DEFAULTS.requireStrong,
@@ -746,6 +770,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     biasTimeframe: AUTO_TRADE_DEFAULTS.biasTimeframe,
     setupTimeframe: AUTO_TRADE_DEFAULTS.setupTimeframe,
     entryTimeframe: AUTO_TRADE_DEFAULTS.entryTimeframe,
+    reentryMode: AUTO_TRADE_DEFAULTS.reentryMode,
     timeframeOverride: AUTO_TRADE_DEFAULTS.timeframeOverride,
     entryMode: AUTO_TRADE_DEFAULTS.entryMode,
     allowMarketFallback: AUTO_TRADE_DEFAULTS.allowMarketFallback,
@@ -764,8 +789,10 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   });
   const settingsWarnings = useMemo(() => {
     const warnings: string[] = [];
+    const sideFilter = String(autoTradeDraft.sideFilter || "");
     const minConfidence = Number(autoTradeDraft.minConfidence);
     const minWinRate = Number(autoTradeDraft.minWinRate);
+    const maxSpreadPoints = Number(autoTradeDraft.maxSpreadPoints);
     const lotCap = Number(autoTradeDraft.botLots);
     const minLot = Number(autoTradeDraft.minLot);
     const lotStep = Number(autoTradeDraft.lotStep);
@@ -780,8 +807,14 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     const cooldownMin = Number(autoTradeDraft.cooldownMin);
     const maxOpenTrades = Number(autoTradeDraft.maxOpenTrades);
 
+    if (!["BOTH", "BUY_ONLY", "SELL_ONLY"].includes(sideFilter)) {
+      warnings.push("Trade Side must be Both, Buy only, or Sell only.");
+    }
     if (!Number.isFinite(lotCap) || lotCap <= 0) {
       warnings.push("Default Bot Lots must be greater than 0.");
+    }
+    if (!Number.isFinite(maxSpreadPoints) || maxSpreadPoints <= 0) {
+      warnings.push("Max Spread Points must be greater than 0.");
     }
     if (!Number.isFinite(minConfidence) || minConfidence < 0 || minConfidence > 100) {
       warnings.push("Min Confidence % must be between 0 and 100.");
@@ -867,6 +900,78 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
 
     return warnings;
   }, [autoTradeDraft]);
+  const hasUnappliedTradeSettings = useMemo(() => {
+    return JSON.stringify(autoTradeDraft) !== JSON.stringify({
+      sideFilter: autoSideFilter,
+      minConfidence: autoMinConfidence,
+      minWinRate: autoMinWinRate,
+      minRR: autoMinRR,
+      maxSpreadPoints: autoMaxSpreadPointsSetting,
+      cooldownMin: sanitizeCooldownMinutes(autoCooldownMin, 15),
+      maxOpenTrades: sanitizeMaxOpenTrades(autoMaxOpenTrades, 1),
+      requireStrong: autoRequireStrongSignal,
+      enforceTrendStack: autoEnforceTrendStack,
+      enforceSymbolCooldown: autoEnforceSymbolCooldown,
+      enforceDailyLossLimit: autoEnforceDailyLossLimit,
+      enforceHardRiskBlock: autoEnforceHardRiskBlock,
+      strategyMode: autoStrategyMode,
+      scalpAggressive: autoScalpAggressive,
+      sessionGateEnabled: autoSessionGateEnabled,
+      biasTimeframe: AUTO_BIAS_TIMEFRAME,
+      setupTimeframe: AUTO_SETUP_TIMEFRAME,
+      entryTimeframe: autoEntryTimeframe,
+      reentryMode: autoReentryMode,
+      timeframeOverride: autoTradeTimeframeOverride,
+      entryMode: autoEntryMode,
+      allowMarketFallback: autoAllowMarketFallback,
+      fallbackMinConfidence: autoFallbackMinConfidence,
+      fallbackRrBuffer: autoFallbackRrBuffer,
+      botLots: autoBotLots,
+      riskMode: autoRiskMode,
+      useDynamicLot: autoUseDynamicLot,
+      riskPct: autoRiskPct,
+      riskUsd: autoRiskUsd,
+      riskGuardMult: autoRiskGuardMult,
+      minSlPoints: autoMinSlPoints,
+      atrBufferMult: autoAtrBufferMult,
+      minLot: autoDynamicMinLot,
+      lotStep: autoDynamicLotStep,
+    });
+  }, [
+    autoTradeDraft,
+    autoSideFilter,
+    autoMinConfidence,
+    autoMinWinRate,
+    autoMinRR,
+    autoMaxSpreadPointsSetting,
+    autoCooldownMin,
+    autoMaxOpenTrades,
+    autoRequireStrongSignal,
+    autoEnforceTrendStack,
+    autoEnforceSymbolCooldown,
+    autoEnforceDailyLossLimit,
+    autoEnforceHardRiskBlock,
+    autoStrategyMode,
+    autoScalpAggressive,
+    autoSessionGateEnabled,
+    autoEntryTimeframe,
+    autoReentryMode,
+    autoTradeTimeframeOverride,
+    autoEntryMode,
+    autoAllowMarketFallback,
+    autoFallbackMinConfidence,
+    autoFallbackRrBuffer,
+    autoBotLots,
+    autoRiskMode,
+    autoUseDynamicLot,
+    autoRiskPct,
+    autoRiskUsd,
+    autoRiskGuardMult,
+    autoMinSlPoints,
+    autoAtrBufferMult,
+    autoDynamicMinLot,
+    autoDynamicLotStep,
+  ]);
   const [autoTradeBusy, setAutoTradeBusy] = useState(false);
   const [autoTradeStatus, setAutoTradeStatus] = useState("");
   const [autoTradeLogs, setAutoTradeLogs] = useState<AutoTradeLogEntry[]>([]);
@@ -889,6 +994,15 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   const [protectBreakEvenProfitUsd, setProtectBreakEvenProfitUsd] = useState(HEADLESS_OVERNIGHT_BREAK_EVEN_PROFIT_USD);
   const [protectDegradeCloseEnabled, setProtectDegradeCloseEnabled] = useState(true);
   const [protectDegradeMinConfidence, setProtectDegradeMinConfidence] = useState("82");
+  const [protectBiasFlipProfitLockEnabled, setProtectBiasFlipProfitLockEnabled] = useState(true);
+  const [protectBiasFlipTpProgressPct, setProtectBiasFlipTpProgressPct] = useState(HEADLESS_BIAS_FLIP_TP_PROGRESS_PCT);
+  const [protectOvernightProfitRetraceLockEnabled, setProtectOvernightProfitRetraceLockEnabled] = useState(true);
+  const [protectOvernightProfitRetraceArmUsd, setProtectOvernightProfitRetraceArmUsd] = useState(
+    HEADLESS_OVERNIGHT_RETRACE_ARM_USD
+  );
+  const [protectOvernightProfitRetraceCloseUsd, setProtectOvernightProfitRetraceCloseUsd] = useState(
+    HEADLESS_OVERNIGHT_RETRACE_CLOSE_USD
+  );
   const [protectOvernightEnabled, setProtectOvernightEnabled] = useState(true);
   const [protectOvernightProfitUsd, setProtectOvernightProfitUsd] = useState(HEADLESS_OVERNIGHT_TARGET_PROFIT_USD);
   const [protectOvernightLossUsd, setProtectOvernightLossUsd] = useState(HEADLESS_OVERNIGHT_LOSS_USD);
@@ -897,10 +1011,58 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   const [showRiskCalcModule, setShowRiskCalcModule] = useState(false);
   const [showManualOrderSection, setShowManualOrderSection] = useState(false);
   const protectBusyRef = useRef(false);
+  const overnightProfitRetraceStateRef = useRef<Record<number, { armed: boolean; peakProfitUsd: number }>>({});
   const settingsImportInputRef = useRef<HTMLInputElement | null>(null);
   const tradeCommandBusyRef = useRef(false);
   const policyRunSeqRef = useRef(0);
   const runPolicyDiagnosticsRef = useRef<() => Promise<void>>(async () => {});
+  const checkOrderDuplicate = (payload: Record<string, unknown>): string | null => {
+    try {
+      const dedup = getGlobalDeduplicator();
+      const symbol = String(payload.symbol || "");
+      const action = String(payload.action || "");
+      const side = payload.side ? String(payload.side) : undefined;
+      const price = payload.price ? Number(payload.price) : undefined;
+
+      const reason = dedup.canPlaceOrder(symbol, action, side, price);
+      if (reason) {
+        console.warn("Order blocked (duplicate):", reason);
+        return reason;
+      }
+
+      return null;
+    } catch (e) {
+      console.error("Error checking order duplicate:", e);
+      return null;
+    }
+  };
+  const registerOrderExecution = (payload: Record<string, unknown>): void => {
+    try {
+      const dedup = getGlobalDeduplicator();
+      const symbol = String(payload.symbol || "");
+      const action = String(payload.action || "");
+      const side = payload.side ? String(payload.side) : undefined;
+      const price = payload.price ? Number(payload.price) : undefined;
+
+      dedup.registerOrder(symbol, action, side, price);
+    } catch (e) {
+      console.error("Error registering order:", e);
+    }
+  };
+  const clearRegisteredOrder = (payload: Record<string, unknown>): void => {
+    try {
+      const dedup = getGlobalDeduplicator();
+      const symbol = String(payload.symbol || "");
+      const action = String(payload.action || "");
+      const side = payload.side ? String(payload.side) : undefined;
+      const price = payload.price ? Number(payload.price) : undefined;
+      if (!symbol || !action) return;
+      const parts = [symbol, action, side || "", price || ""].filter(Boolean);
+      dedup.clearOrder(symbol, parts.join(":").toLowerCase());
+    } catch (e) {
+      console.error("Error clearing registered order:", e);
+    }
+  };
   const [policyBusy, setPolicyBusy] = useState(false);
   const [policyByPanel, setPolicyByPanel] = useState<Record<string, PanelPolicyDiagnostics>>({});
   const [autoEligibilityByPanel, setAutoEligibilityByPanel] = useState<Record<string, PanelAutoEligibility>>({});
@@ -1000,9 +1162,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     ],
     auto: {
       enabled: autoTradeEnabled,
+      sideFilter: autoSideFilter,
       minConfidence: Number(autoMinConfidence),
       minWinRate: Number(autoMinWinRate),
       minRR: Number(autoMinRR),
+      maxSpreadPoints: Number(autoMaxSpreadPointsSetting),
       cooldownMin: effectiveCooldownMin,
       maxOpenTrades: effectiveMaxOpenTrades,
       requireStrong: autoRequireStrongSignal,
@@ -1016,6 +1180,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       biasTimeframe: AUTO_BIAS_TIMEFRAME,
       setupTimeframe: AUTO_SETUP_TIMEFRAME,
       entryTimeframe: autoEntryTimeframe,
+      reentryMode: autoReentryMode,
       timeframeOverride: autoTradeTimeframeOverride,
       entryMode: autoEntryMode,
       allowMarketFallback: autoAllowMarketFallback,
@@ -1054,6 +1219,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       breakEvenProfitUsd: Number(protectBreakEvenProfitUsd),
       degradeCloseEnabled: protectDegradeCloseEnabled,
       degradeMinConfidence: Number(protectDegradeMinConfidence),
+      biasFlipProfitLockEnabled: protectBiasFlipProfitLockEnabled,
+      biasFlipTpProgressPct: Number(protectBiasFlipTpProgressPct),
+      overnightProfitRetraceLockEnabled: protectOvernightProfitRetraceLockEnabled,
+      overnightProfitRetraceArmUsd: Number(protectOvernightProfitRetraceArmUsd),
+      overnightProfitRetraceCloseUsd: Number(protectOvernightProfitRetraceCloseUsd),
       overnightEnabled: protectOvernightEnabled,
       overnightProfitUsd: Number(protectOvernightProfitUsd),
       overnightLossUsd: Number(protectOvernightLossUsd),
@@ -1404,7 +1574,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     import.meta.env.VITE_BROKER_DAILY_BREAK_END_UTC as string | undefined,
     22 * 60 + 5
   );
-  const autoMaxSpreadPoints = Math.max(
+  const runtimeDefaultMaxSpreadPoints = Math.max(
     1,
     Number(
       (import.meta.env.VITE_AUTO_MAX_SPREAD_POINTS as string | undefined) ??
@@ -1487,13 +1657,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   };
   const pushBotExecutionAuditLog = (
     symbol: string,
-    stage:
-      | "PREPARE_SENT"
-      | "PREPARE_OK"
-      | "PREPARE_FAIL"
-      | "CONFIRM_SENT"
-      | "EXECUTION_OK"
-      | "EXECUTION_FAIL",
+    stage: BotExecutionStage,
     details: string
   ) => {
     const now = Date.now();
@@ -1583,7 +1747,8 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   };
   const getSpreadGuardPointsForSymbol = (symbol: string): number => {
     const preset = getSymbolExecutionPreset(symbol);
-    return Math.max(1, autoMaxSpreadPoints * preset.spreadMult);
+    const configuredBaseSpread = Math.max(1, Number(autoTradeDraft.maxSpreadPoints) || runtimeDefaultMaxSpreadPoints);
+    return Math.max(1, configuredBaseSpread * preset.spreadMult);
   };
   const getSlippageGuardPointsForSymbol = (symbol: string): number => {
     const preset = getSymbolExecutionPreset(symbol);
@@ -1709,9 +1874,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   ]);
 
   const buildRecommendedAutoTradeDraft = (): typeof autoTradeDraft => ({
+    sideFilter: AUTO_TRADE_DEFAULTS.sideFilter,
     minConfidence: AUTO_TRADE_DEFAULTS.minConfidence,
     minWinRate: AUTO_TRADE_DEFAULTS.minWinRate,
     minRR: AUTO_TRADE_DEFAULTS.minRR,
+    maxSpreadPoints: AUTO_TRADE_DEFAULTS.maxSpreadPoints,
     cooldownMin: AUTO_TRADE_DEFAULTS.cooldownMin,
     maxOpenTrades: AUTO_TRADE_DEFAULTS.maxOpenTrades,
     requireStrong: AUTO_TRADE_DEFAULTS.requireStrong,
@@ -1725,6 +1892,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     biasTimeframe: AUTO_TRADE_DEFAULTS.biasTimeframe,
     setupTimeframe: AUTO_TRADE_DEFAULTS.setupTimeframe,
     entryTimeframe: AUTO_TRADE_DEFAULTS.entryTimeframe,
+    reentryMode: AUTO_TRADE_DEFAULTS.reentryMode,
     timeframeOverride: AUTO_TRADE_DEFAULTS.timeframeOverride,
     entryMode: AUTO_TRADE_DEFAULTS.entryMode,
     allowMarketFallback: AUTO_TRADE_DEFAULTS.allowMarketFallback,
@@ -1744,11 +1912,13 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
 
   const applyAutoTradeSettings = (
     nextDraft: typeof autoTradeDraft,
-    options?: { statusMessage?: string; alertMessage?: string }
+    options?: { statusMessage?: string; alertMessage?: string; silent?: boolean }
   ) => {
+    setAutoSideFilter(nextDraft.sideFilter);
     setAutoMinConfidence(nextDraft.minConfidence);
     setAutoMinWinRate(nextDraft.minWinRate);
     setAutoMinRR(nextDraft.minRR);
+    setAutoMaxSpreadPointsSetting(nextDraft.maxSpreadPoints);
     const nextCooldownMin = sanitizeCooldownMinutes(nextDraft.cooldownMin, 15);
     const nextMaxOpenTrades = sanitizeMaxOpenTrades(nextDraft.maxOpenTrades, 1);
     setAutoCooldownMin(nextCooldownMin);
@@ -1762,6 +1932,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     setAutoScalpAggressive(nextDraft.scalpAggressive);
     setAutoSessionGateEnabled(nextDraft.sessionGateEnabled);
     setAutoEntryTimeframe(nextDraft.entryTimeframe);
+    setAutoReentryMode(nextDraft.reentryMode);
     setAutoTradeTimeframeOverride(nextDraft.timeframeOverride);
     setAutoEntryMode(nextDraft.entryMode);
     setAutoAllowMarketFallback(nextDraft.allowMarketFallback);
@@ -1784,9 +1955,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       JSON.stringify({
         runtimeMode: autoRuntimeMode,
         enabled: autoTradeEnabled,
+        sideFilter: nextDraft.sideFilter,
         minConfidence: nextDraft.minConfidence,
         minWinRate: nextDraft.minWinRate,
         minRR: nextDraft.minRR,
+        maxSpreadPoints: nextDraft.maxSpreadPoints,
         cooldownMin: nextCooldownMin,
         maxOpenTrades: nextMaxOpenTrades,
         requireStrong: nextDraft.requireStrong,
@@ -1800,6 +1973,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         biasTimeframe: AUTO_BIAS_TIMEFRAME,
         setupTimeframe: AUTO_SETUP_TIMEFRAME,
         entryTimeframe: nextDraft.entryTimeframe,
+        reentryMode: nextDraft.reentryMode,
         timeframeOverride: nextDraft.timeframeOverride,
         entryMode: nextDraft.entryMode,
         allowMarketFallback: nextDraft.allowMarketFallback,
@@ -1820,7 +1994,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       })
     );
     localStorage.setItem("assistant.profile", accountProfile);
-    setAutoTradeStatus(options?.statusMessage || "Trading settings saved and applied. Rechecking policy diagnostics...");
+    if (!options?.silent) {
+      setAutoTradeStatus(options?.statusMessage || "Trading settings saved and applied. Rechecking policy diagnostics...");
+    }
     setTimeout(() => {
       void runPolicyDiagnostics();
     }, 0);
@@ -1844,6 +2020,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     setProtectBreakEvenProfitUsd(HEADLESS_OVERNIGHT_BREAK_EVEN_PROFIT_USD);
     setProtectDegradeCloseEnabled(true);
     setProtectDegradeMinConfidence("82");
+    setProtectBiasFlipProfitLockEnabled(true);
+    setProtectBiasFlipTpProgressPct(HEADLESS_BIAS_FLIP_TP_PROGRESS_PCT);
+    setProtectOvernightProfitRetraceLockEnabled(true);
+    setProtectOvernightProfitRetraceArmUsd(HEADLESS_OVERNIGHT_RETRACE_ARM_USD);
+    setProtectOvernightProfitRetraceCloseUsd(HEADLESS_OVERNIGHT_RETRACE_CLOSE_USD);
     setProtectEnabled(true);
     setProtectOvernightEnabled(true);
     setProtectOvernightProfitUsd(HEADLESS_OVERNIGHT_TARGET_PROFIT_USD);
@@ -2058,6 +2239,10 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
 
     const ma50 = sma(closes, 50) ?? closes[closes.length - 1];
     const ma200 = sma(closes, 200) ?? sma(closes, 100) ?? closes[closes.length - 1];
+    const previousCloses = closes.slice(0, -1);
+    const previousMa200 = previousCloses.length
+      ? sma(previousCloses, 200) ?? sma(previousCloses, 100) ?? previousCloses[previousCloses.length - 1]
+      : ma200;
     const recentHigh = Math.max(...highs.slice(-50));
     const recentLow = Math.min(...lows.slice(-50));
     const swingSlice = candles.slice(-31, -1);
@@ -2068,6 +2253,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       ? Math.min(...swingSlice.map((candle) => candle.low))
       : recentLow;
     const atr = computeAtr(candles, 14);
+    const safeAtr = Number.isFinite(atr) && atr > 0 ? atr : Math.max(Math.abs(recentHigh - recentLow) / 14, 1e-9);
+    const ma200Slope = ma200 - previousMa200;
+    const ma200SlopeAtrRatio = safeAtr > 0 ? Math.abs(ma200Slope) / safeAtr : 0;
     const rsi = computeRsi(closes, 14);
     const change = last.close - prev.close;
     const changePercent = prev.close !== 0 ? (change / prev.close) * 100 : 0;
@@ -2088,6 +2276,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       atr,
       movingAverage50: ma50,
       movingAverage200: ma200,
+      movingAverage200Prev: previousMa200,
+      movingAverage200Slope: ma200Slope,
+      movingAverage200SlopeAtrRatio: ma200SlopeAtrRatio,
       lastCandleTime: last.time,
     };
   };
@@ -2096,6 +2287,102 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   const generatePriceData = async (symbol: string, timeframe: ChartTimeframe): Promise<PriceData | null> => {
     const candles = await fetchMt4Candles(symbol, timeframe, 320);
     return buildPriceDataFromCandles(symbol, candles);
+  };
+
+  const evaluateCooldownReentryConfirmation = async (
+    symbol: string,
+    side: "BUY" | "SELL"
+  ): Promise<{ ok: boolean; reason: string; m5Detail: string; m1Detail: string; m5Ok: boolean; m1Ok: boolean }> => {
+    if (autoReentryMode === "OFF") {
+      return {
+        ok: true,
+        reason: "Re-entry confirmation disabled",
+        m5Detail: "Mode OFF",
+        m1Detail: "Mode OFF",
+        m5Ok: true,
+        m1Ok: true,
+      };
+    }
+
+    const m5Candles = await fetchMt4Candles(symbol, "M5", 12);
+    const closedM5 = m5Candles.slice(0, -1).slice(-4);
+    if (closedM5.length < 4) {
+      return {
+        ok: false,
+        reason: "M5 re-entry bias unavailable",
+        m5Detail: "Need 4 closed M5 candles",
+        m1Detail: "M1 confirmation skipped",
+        m5Ok: false,
+        m1Ok: false,
+      };
+    }
+
+    const bullishM5 = closedM5.filter((candle) => candle.close > candle.open).length;
+    const bearishM5 = closedM5.filter((candle) => candle.close < candle.open).length;
+    const m5NetMove = closedM5[closedM5.length - 1].close - closedM5[0].open;
+    const requiredM5Count = autoReentryMode === "STRICT" ? 4 : 3;
+    const m5BiasOk =
+      side === "BUY" ? bullishM5 >= requiredM5Count && m5NetMove > 0 : bearishM5 >= requiredM5Count && m5NetMove < 0;
+    const m5Detail =
+      side === "BUY"
+        ? `${bullishM5}/4 bullish, need ${requiredM5Count}, net ${m5NetMove >= 0 ? "+" : ""}${m5NetMove.toFixed(5)}`
+        : `${bearishM5}/4 bearish, need ${requiredM5Count}, net ${m5NetMove >= 0 ? "+" : ""}${m5NetMove.toFixed(5)}`;
+
+    const m1Candles = await fetchMt4Candles(symbol, "M1", 90);
+    const closedM1 = m1Candles.slice(0, -1);
+    const m1Data = buildPriceDataFromCandles(symbol, closedM1);
+    const m1LastClosed = closedM1[closedM1.length - 1];
+    if (!m1Data || !m1LastClosed) {
+      return {
+        ok: false,
+        reason: "M1 confirmation unavailable",
+        m5Detail,
+        m1Detail: "Need closed M1 history",
+        m5Ok: m5BiasOk,
+        m1Ok: false,
+      };
+    }
+
+    const m1Signal = generateTradeSignal(m1Data);
+    const m1CandleOk = side === "BUY" ? m1LastClosed.close > m1LastClosed.open : m1LastClosed.close < m1LastClosed.open;
+    const m1SignalOk = m1Signal.signal === side;
+    const m1EmaOk =
+      side === "BUY" ? m1LastClosed.close >= m1Data.movingAverage50 : m1LastClosed.close <= m1Data.movingAverage50;
+    const requireEmaFilter = autoReentryMode === "STRICT";
+    const m1Detail = `${m1Signal.signal} signal, latest M1 candle ${m1CandleOk ? "confirms" : "opposes"}${
+      requireEmaFilter ? `, EMA50 ${m1EmaOk ? "aligned" : "not aligned"}` : ""
+    }`;
+    const m1ConfirmationOk = m1SignalOk && m1CandleOk && (!requireEmaFilter || m1EmaOk);
+
+    if (!m5BiasOk) {
+      return {
+        ok: false,
+        reason: `Previous 4 M5 candles do not support ${side} bias`,
+        m5Detail,
+        m1Detail,
+        m5Ok: false,
+        m1Ok: m1ConfirmationOk,
+      };
+    }
+    if (!m1ConfirmationOk) {
+      return {
+        ok: false,
+        reason: `M1 confirmation does not match ${side} bias`,
+        m5Detail,
+        m1Detail,
+        m5Ok: true,
+        m1Ok: false,
+      };
+    }
+
+    return {
+      ok: true,
+      reason: `M5 bias and M1 confirmation aligned for ${side}`,
+      m5Detail,
+      m1Detail,
+      m5Ok: true,
+      m1Ok: true,
+    };
   };
 
   const generateBoardPriceData = async (symbol: string, timeframe: ChartTimeframe): Promise<PriceData | null> => {
@@ -2587,9 +2874,13 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
           setAutoRuntimeMode(parsed.runtimeMode);
         }
         if (typeof parsed?.enabled === "boolean") setAutoTradeEnabled(parsed.enabled);
+        if (parsed?.sideFilter === "BOTH" || parsed?.sideFilter === "BUY_ONLY" || parsed?.sideFilter === "SELL_ONLY") {
+          setAutoSideFilter(parsed.sideFilter);
+        }
         if (parsed?.minConfidence !== undefined) setAutoMinConfidence(String(parsed.minConfidence));
         if (parsed?.minWinRate !== undefined) setAutoMinWinRate(String(parsed.minWinRate));
         if (parsed?.minRR !== undefined) setAutoMinRR(String(parsed.minRR));
+        if (parsed?.maxSpreadPoints !== undefined) setAutoMaxSpreadPointsSetting(String(parsed.maxSpreadPoints));
         if (parsed?.cooldownMin !== undefined) setAutoCooldownMin(sanitizeCooldownMinutes(parsed.cooldownMin, 15));
         if (parsed?.maxOpenTrades !== undefined) setAutoMaxOpenTrades(sanitizeMaxOpenTrades(parsed.maxOpenTrades, 1));
         if (typeof parsed?.requireStrong === "boolean") setAutoRequireStrongSignal(parsed.requireStrong);
@@ -2606,6 +2897,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
           setAutoEntryTimeframe(parsed.entryTimeframe);
         } else if (parsed?.trendAlignment === "M15_H1_H4" || parsed?.trendAlignment === "M5_H1_H4") {
           setAutoEntryTimeframe(parsed.trendAlignment === "M5_H1_H4" ? "M5" : "M15");
+        }
+        if (parsed?.reentryMode === "OFF" || parsed?.reentryMode === "BALANCED" || parsed?.reentryMode === "STRICT") {
+          setAutoReentryMode(parsed.reentryMode);
         }
         if (parsed?.timeframeOverride) setAutoTradeTimeframeOverride(parsed.timeframeOverride);
         if (parsed?.entryMode === "MARKET" || parsed?.entryMode === "LIMIT_SR") setAutoEntryMode(parsed.entryMode);
@@ -2650,9 +2944,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     const payload = JSON.stringify({
       runtimeMode: autoRuntimeMode,
       enabled: autoTradeEnabled,
+      sideFilter: autoSideFilter,
       minConfidence: autoMinConfidence,
       minWinRate: autoMinWinRate,
       minRR: autoMinRR,
+      maxSpreadPoints: autoMaxSpreadPointsSetting,
       cooldownMin: autoCooldownMin,
       maxOpenTrades: sanitizeMaxOpenTrades(autoMaxOpenTrades, 1),
       requireStrong: autoRequireStrongSignal,
@@ -2666,6 +2962,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       biasTimeframe: AUTO_BIAS_TIMEFRAME,
       setupTimeframe: AUTO_SETUP_TIMEFRAME,
       entryTimeframe: autoEntryTimeframe,
+      reentryMode: autoReentryMode,
       timeframeOverride: autoTradeTimeframeOverride,
       entryMode: autoEntryMode,
       allowMarketFallback: autoAllowMarketFallback,
@@ -2688,9 +2985,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   }, [
     autoTradeEnabled,
     autoRuntimeMode,
+    autoSideFilter,
     autoMinConfidence,
     autoMinWinRate,
     autoMinRR,
+    autoMaxSpreadPointsSetting,
     autoCooldownMin,
     autoMaxOpenTrades,
     autoRequireStrongSignal,
@@ -2702,6 +3001,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     autoScalpAggressive,
     autoSessionGateEnabled,
     autoEntryTimeframe,
+    autoReentryMode,
     autoTradeTimeframeOverride,
     autoEntryMode,
     autoAllowMarketFallback,
@@ -2781,9 +3081,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   useEffect(() => {
     if (!showTradeSettings) return;
     setAutoTradeDraft({
+      sideFilter: autoSideFilter,
       minConfidence: autoMinConfidence,
       minWinRate: autoMinWinRate,
       minRR: autoMinRR,
+      maxSpreadPoints: autoMaxSpreadPointsSetting,
       cooldownMin: autoCooldownMin,
       maxOpenTrades: sanitizeMaxOpenTrades(autoMaxOpenTrades, 1),
       requireStrong: autoRequireStrongSignal,
@@ -2797,6 +3099,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       biasTimeframe: AUTO_BIAS_TIMEFRAME,
       setupTimeframe: AUTO_SETUP_TIMEFRAME,
       entryTimeframe: autoEntryTimeframe,
+      reentryMode: autoReentryMode,
       timeframeOverride: autoTradeTimeframeOverride,
       entryMode: autoEntryMode,
       allowMarketFallback: autoAllowMarketFallback,
@@ -2815,9 +3118,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     });
   }, [
     showTradeSettings,
+    autoSideFilter,
     autoMinConfidence,
     autoMinWinRate,
     autoMinRR,
+    autoMaxSpreadPointsSetting,
     autoCooldownMin,
     autoMaxOpenTrades,
     autoRequireStrongSignal,
@@ -2829,6 +3134,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     autoScalpAggressive,
     autoSessionGateEnabled,
     autoEntryTimeframe,
+    autoReentryMode,
     autoTradeTimeframeOverride,
     autoEntryMode,
     autoAllowMarketFallback,
@@ -2847,6 +3153,15 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   ]);
 
   useEffect(() => {
+    if (!showTradeSettings || !autoTradeLoaded || !hasUnappliedTradeSettings) return;
+    const timeoutId = window.setTimeout(() => {
+      applyAutoTradeSettings(autoTradeDraft, { silent: true });
+    }, 250);
+    return () => window.clearTimeout(timeoutId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showTradeSettings, autoTradeLoaded, autoTradeDraft, hasUnappliedTradeSettings]);
+
+  useEffect(() => {
     const raw = localStorage.getItem("assistant.protect");
     if (!raw) return;
     try {
@@ -2863,6 +3178,17 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       if (parsed?.breakEvenProfitUsd !== undefined) setProtectBreakEvenProfitUsd(String(parsed.breakEvenProfitUsd));
       if (typeof parsed?.degradeCloseEnabled === "boolean") setProtectDegradeCloseEnabled(parsed.degradeCloseEnabled);
       if (parsed?.degradeMinConfidence !== undefined) setProtectDegradeMinConfidence(String(parsed.degradeMinConfidence));
+      if (typeof parsed?.biasFlipProfitLockEnabled === "boolean") setProtectBiasFlipProfitLockEnabled(parsed.biasFlipProfitLockEnabled);
+      if (parsed?.biasFlipTpProgressPct !== undefined) setProtectBiasFlipTpProgressPct(String(parsed.biasFlipTpProgressPct));
+      if (typeof parsed?.overnightProfitRetraceLockEnabled === "boolean") {
+        setProtectOvernightProfitRetraceLockEnabled(parsed.overnightProfitRetraceLockEnabled);
+      }
+      if (parsed?.overnightProfitRetraceArmUsd !== undefined) {
+        setProtectOvernightProfitRetraceArmUsd(String(parsed.overnightProfitRetraceArmUsd));
+      }
+      if (parsed?.overnightProfitRetraceCloseUsd !== undefined) {
+        setProtectOvernightProfitRetraceCloseUsd(String(parsed.overnightProfitRetraceCloseUsd));
+      }
       if (typeof parsed?.overnightEnabled === "boolean") setProtectOvernightEnabled(parsed.overnightEnabled);
       if (parsed?.overnightProfitUsd !== undefined) setProtectOvernightProfitUsd(String(parsed.overnightProfitUsd));
       if (parsed?.overnightLossUsd !== undefined) setProtectOvernightLossUsd(String(parsed.overnightLossUsd));
@@ -2885,6 +3211,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       breakEvenProfitUsd: protectBreakEvenProfitUsd,
       degradeCloseEnabled: protectDegradeCloseEnabled,
       degradeMinConfidence: protectDegradeMinConfidence,
+      biasFlipProfitLockEnabled: protectBiasFlipProfitLockEnabled,
+      biasFlipTpProgressPct: protectBiasFlipTpProgressPct,
+      overnightProfitRetraceLockEnabled: protectOvernightProfitRetraceLockEnabled,
+      overnightProfitRetraceArmUsd: protectOvernightProfitRetraceArmUsd,
+      overnightProfitRetraceCloseUsd: protectOvernightProfitRetraceCloseUsd,
       overnightEnabled: protectOvernightEnabled,
       overnightProfitUsd: protectOvernightProfitUsd,
       overnightLossUsd: protectOvernightLossUsd,
@@ -2903,6 +3234,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     protectBreakEvenProfitUsd,
     protectDegradeCloseEnabled,
     protectDegradeMinConfidence,
+    protectBiasFlipProfitLockEnabled,
+    protectBiasFlipTpProgressPct,
+    protectOvernightProfitRetraceLockEnabled,
+    protectOvernightProfitRetraceArmUsd,
+    protectOvernightProfitRetraceCloseUsd,
     protectOvernightEnabled,
     protectOvernightProfitUsd,
     protectOvernightLossUsd,
@@ -2942,9 +3278,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     autoRuntimeMode,
     autoTradeLoaded,
     autoTradeEnabled,
+    autoSideFilter,
     autoMinConfidence,
     autoMinWinRate,
     autoMinRR,
+    autoMaxSpreadPointsSetting,
     autoCooldownMin,
     autoMaxOpenTrades,
     autoRequireStrongSignal,
@@ -2983,6 +3321,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     protectBreakEvenProfitUsd,
     protectDegradeCloseEnabled,
     protectDegradeMinConfidence,
+    protectBiasFlipProfitLockEnabled,
+    protectBiasFlipTpProgressPct,
+    protectOvernightProfitRetraceLockEnabled,
+    protectOvernightProfitRetraceArmUsd,
+    protectOvernightProfitRetraceCloseUsd,
     protectOvernightEnabled,
     protectOvernightProfitUsd,
     protectOvernightLossUsd,
@@ -3492,6 +3835,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     const breakEvenProfitUsd = Math.max(0.01, Number(protectBreakEvenProfitUsd) || 0.3);
     const degradeCloseEnabled = protectDegradeCloseEnabled;
     const degradeMinConfidence = Math.max(0, Math.min(100, Number(protectDegradeMinConfidence) || 82));
+    const biasFlipProfitLockEnabled = protectBiasFlipProfitLockEnabled;
+    const biasFlipTpProgressPct = Math.max(1, Math.min(100, Number(protectBiasFlipTpProgressPct) || 35));
+    const overnightProfitRetraceLockEnabled = protectOvernightProfitRetraceLockEnabled;
+    const overnightProfitRetraceArmUsd = Math.max(0.01, Number(protectOvernightProfitRetraceArmUsd) || 0.8);
+    const overnightProfitRetraceCloseUsd = Math.max(0.01, Number(protectOvernightProfitRetraceCloseUsd) || 0.4);
     const overnightEnabled = protectOvernightEnabled;
     const overnightProfitUsd = Math.max(0.01, Number(protectOvernightProfitUsd) || 1.1);
     const overnightLossUsd = Math.max(0.01, Number(protectOvernightLossUsd) || 1.2);
@@ -3509,6 +3857,13 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     > = {};
 
     const executeAction = async (payload: Record<string, unknown>) => {
+      // Check for duplicate orders BEFORE executing (don't register yet)
+      const duplicateReason = checkOrderDuplicate(payload);
+      if (duplicateReason) {
+        tradeCommandBusyRef.current = false;
+        return { ok: false as const, reason: duplicateReason };
+      }
+
       tradeCommandBusyRef.current = true;
       try {
         const prepareResponse = await fetch(`${mt4BridgeBase}/orders/prepare`, {
@@ -3542,6 +3897,8 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
           return { ok: false as const, reason };
         }
 
+        registerOrderExecution(payload);
+        clearRegisteredOrder(payload);
         return { ok: true as const };
       } finally {
         tradeCommandBusyRef.current = false;
@@ -3584,7 +3941,17 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         ? (openData.positions as OpenPosition[])
         : [];
 
-      if (!positions.length) return;
+      if (!positions.length) {
+        overnightProfitRetraceStateRef.current = {};
+        return;
+      }
+
+      const openTicketSet = new Set(positions.map((position) => Number(position.ticket)));
+      Object.keys(overnightProfitRetraceStateRef.current).forEach((ticket) => {
+        if (!openTicketSet.has(Number(ticket))) {
+          delete overnightProfitRetraceStateRef.current[Number(ticket)];
+        }
+      });
 
       const updates: string[] = [];
       const closures: string[] = [];
@@ -3597,7 +3964,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
 
         const tick = await fetchMt4Tick(symbol);
         let floatingPnl = Number.NaN;
-        if (overnightEnabled && tick) {
+        if (tick) {
           const spec = await readSpec(symbol);
           const entry = Number(position.openPrice);
           const lots = Number(position.lots);
@@ -3619,7 +3986,18 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
               side === "BUY"
                 ? (closePrice - entry) * moneyPerPricePerLot * lots
                 : (entry - closePrice) * moneyPerPricePerLot * lots;
-            if (Number.isFinite(floatingPnl) && floatingPnl <= -overnightLossUsd) {
+            if (overnightEnabled && Number.isFinite(floatingPnl)) {
+              const retraceState = overnightProfitRetraceStateRef.current[position.ticket] || {
+                armed: false,
+                peakProfitUsd: Number.NEGATIVE_INFINITY,
+              };
+              retraceState.peakProfitUsd = Math.max(retraceState.peakProfitUsd, floatingPnl);
+              if (!retraceState.armed && retraceState.peakProfitUsd >= overnightProfitRetraceArmUsd) {
+                retraceState.armed = true;
+              }
+              overnightProfitRetraceStateRef.current[position.ticket] = retraceState;
+            }
+            if (overnightEnabled && Number.isFinite(floatingPnl) && floatingPnl <= -overnightLossUsd) {
               const closeAction = await executeAction({
                 action: "CLOSE",
                 ticket: position.ticket,
@@ -3633,7 +4011,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
               }
               failures.push(`${symbol}: ${closeAction.reason || "overnight loss close failed"}`);
             }
-            if (Number.isFinite(floatingPnl) && floatingPnl >= overnightProfitUsd) {
+            if (overnightEnabled && Number.isFinite(floatingPnl) && floatingPnl >= overnightProfitUsd) {
               const closeAction = await executeAction({
                 action: "CLOSE",
                 ticket: position.ticket,
@@ -3646,6 +4024,29 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                 continue;
               }
               failures.push(`${symbol}: ${closeAction.reason || "overnight close failed"}`);
+            }
+            const retraceState = overnightProfitRetraceStateRef.current[position.ticket];
+            if (
+              overnightEnabled &&
+              overnightProfitRetraceLockEnabled &&
+              retraceState?.armed &&
+              Number.isFinite(floatingPnl) &&
+              floatingPnl > 0 &&
+              floatingPnl <= overnightProfitRetraceCloseUsd
+            ) {
+              const closeAction = await executeAction({
+                action: "CLOSE",
+                ticket: position.ticket,
+                lots: position.lots,
+              });
+              if (closeAction.ok) {
+                closures.push(
+                  `${symbol} #${position.ticket} closed by overnight retrace lock (armed at +$${overnightProfitRetraceArmUsd.toFixed(2)}, retraced to +$${floatingPnl.toFixed(2)})`
+                );
+                delete overnightProfitRetraceStateRef.current[position.ticket];
+                continue;
+              }
+              failures.push(`${symbol}: ${closeAction.reason || "overnight retrace close failed"}`);
             }
           }
         }
@@ -3722,6 +4123,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         if (!Number.isFinite(current)) continue;
         const pointSize = getPointSizeForSymbol(symbol, current);
         const minDistance = minStopPoints * pointSize;
+        const entry = Number(position.openPrice);
 
         if (degradeCloseEnabled) {
           const normalizedPosition = normalizeSymbol(symbol);
@@ -3741,18 +4143,35 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
             ((side === "BUY" && protectSignal.signal === "SELL") ||
               (side === "SELL" && protectSignal.signal === "BUY"));
           if (isOpposite && (protectSignal?.confidence || 0) >= degradeMinConfidence) {
-            const closeAction = await executeAction({
-              action: "CLOSE",
-              ticket: position.ticket,
-              lots: position.lots,
-            });
-            if (closeAction.ok) {
-              closures.push(
-                `${symbol} #${position.ticket} closed (opposite ${protectSignal?.signal} ${protectSignal?.confidence.toFixed(0)}%)`
-              );
-              continue;
+            const tpDistance = side === "BUY" ? Number(position.tp) - entry : entry - Number(position.tp);
+            const favorableDistance = side === "BUY" ? current - entry : entry - current;
+            const tpProgressPct =
+              Number.isFinite(tpDistance) && tpDistance > 0 && Number.isFinite(favorableDistance)
+                ? (favorableDistance / tpDistance) * 100
+                : Number.NaN;
+            const eligibleForProfitLock =
+              biasFlipProfitLockEnabled &&
+              Number.isFinite(floatingPnl) &&
+              floatingPnl > 0 &&
+              Number.isFinite(tpProgressPct) &&
+              tpProgressPct >= biasFlipTpProgressPct;
+
+            if (eligibleForProfitLock || !biasFlipProfitLockEnabled) {
+              const closeAction = await executeAction({
+                action: "CLOSE",
+                ticket: position.ticket,
+                lots: position.lots,
+              });
+              if (closeAction.ok) {
+                closures.push(
+                  eligibleForProfitLock
+                    ? `${symbol} #${position.ticket} closed by bias-flip profit lock (${tpProgressPct.toFixed(0)}% TP progress, opposite ${protectSignal?.signal} ${protectSignal?.confidence.toFixed(0)}%)`
+                    : `${symbol} #${position.ticket} closed (opposite ${protectSignal?.signal} ${protectSignal?.confidence.toFixed(0)}%)`
+                );
+                continue;
+              }
+              failures.push(`${symbol}: ${closeAction.reason || "close failed"}`);
             }
-            failures.push(`${symbol}: ${closeAction.reason || "close failed"}`);
           }
         }
 
@@ -4007,6 +4426,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   const handlePrepareOrder = async () => {
     setTradeBridgeBusy(true);
     setTradeBridgeMessage("");
+    if (pendingOrder) {
+      clearRegisteredOrder(pendingOrder);
+    }
     setPendingOrder(null);
     setConfirmTokenInput("");
     try {
@@ -4049,6 +4471,13 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         if (orderTP.trim()) payload.tp = Number(orderTP);
       }
 
+      // Check for duplicate orders before preparing
+      const duplicateReason = checkOrderDuplicate(payload);
+      if (duplicateReason) {
+        setTradeBridgeMessage(`Blocked: ${duplicateReason}`);
+        return;
+      }
+
       const response = await fetch(`${mt4BridgeBase}/orders/prepare`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -4061,11 +4490,18 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         return;
       }
 
+      // Register order since prepare succeeded
+      registerOrderExecution(payload);
+
       setPendingOrder({
         requestId: data.requestId,
         confirmToken: data.confirmToken,
         summary: data.summary,
         expiresInMs: data.expiresInMs,
+        action: String(payload.action || ""),
+        symbol: String(payload.symbol || ""),
+        side: payload.side ? String(payload.side) : undefined,
+        price: payload.price ? Number(payload.price) : undefined,
       });
       setTradeBridgeMessage("Prepared. Enter confirm token to execute.");
     } catch (error) {
@@ -4095,10 +4531,13 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       const data = await response.json();
 
       if (!response.ok || !data?.ok) {
+        clearRegisteredOrder(pendingOrder);
+        setPendingOrder(null);
         setTradeBridgeMessage(data?.message || data?.error || "Execution failed");
         return;
       }
 
+      clearRegisteredOrder(pendingOrder);
       setTradeBridgeMessage(
         `Executed: ${data.status}${data.ticket ? ` | ticket ${data.ticket}` : ""}${
           data.price ? ` | price ${data.price}` : ""
@@ -4109,6 +4548,8 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       await loadOpenPositions();
       await loadPolicyEvents();
     } catch (error) {
+      clearRegisteredOrder(pendingOrder);
+      setPendingOrder(null);
       setTradeBridgeMessage(error instanceof Error ? error.message : "Confirm request failed");
     } finally {
       setTradeBridgeBusy(false);
@@ -4304,6 +4745,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     const minConfidence = Number(autoMinConfidence);
     const minWinRate = Number(autoMinWinRate);
     const minRR = Number(autoMinRR);
+    const sideFilter = autoSideFilter;
     const maxOpenTrades = effectiveMaxOpenTrades;
     const dynamicLotEnabled = autoUseDynamicLot;
     const riskMode = autoRiskMode;
@@ -4463,6 +4905,24 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       });
     }
 
+    if (
+      (sideFilter === "BUY_ONLY" && orderPlan.side !== "BUY") ||
+      (sideFilter === "SELL_ONLY" && orderPlan.side !== "SELL")
+    ) {
+      return finalizeEvaluation({
+        symbol,
+        panelTimeframe,
+        autoTimeframe,
+        eligible: false,
+        reason: `Side filter blocked ${orderPlan.side} (${sideFilter})`,
+        pass: false,
+        message: `Blocked by side filter: ${sideFilter.replace("_", " ").toLowerCase()}`,
+        checks: [createPolicyCheck("auto_side_filter", false, `Side filter blocked ${orderPlan.side} (${sideFilter})`)],
+        checkedAtMs: nowMs,
+        orderPlan: orderPlan.label,
+      });
+    }
+
     let rrRatio = Number.NaN;
     let strategyBlockReason: string | null = null;
     const localChecks: PolicyCheckItem[] = [];
@@ -4479,6 +4939,13 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         strategyBlockReason = failDetail;
       }
     };
+
+    addLocalCheck(
+      "auto_side_filter",
+      sideFilter === "BOTH" || (sideFilter === "BUY_ONLY" && orderPlan.side === "BUY") || (sideFilter === "SELL_ONLY" && orderPlan.side === "SELL"),
+      sideFilter === "BOTH" ? "Both sides allowed" : `${sideFilter === "BUY_ONLY" ? "Buy" : "Sell"} side allowed`,
+      `Side filter blocked ${orderPlan.side} (${sideFilter})`
+    );
 
     addLocalCheck(
       "auto_confidence",
@@ -4691,6 +5158,20 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         { block: enforceTrendStack }
       );
     }
+
+    const reentryConfirmation = await evaluateCooldownReentryConfirmation(symbol, orderPlan.side);
+    addLocalCheck(
+      "auto_reentry_m5_bias",
+      reentryConfirmation.m5Ok,
+      reentryConfirmation.m5Detail,
+      `${reentryConfirmation.reason} (${reentryConfirmation.m5Detail})`
+    );
+    addLocalCheck(
+      "auto_reentry_m1_confirm",
+      reentryConfirmation.m1Ok,
+      reentryConfirmation.m1Detail,
+      `${reentryConfirmation.reason} (${reentryConfirmation.m1Detail})`
+    );
 
     // Guard high spread before policy/execution (all symbols).
     if (liveTick) {
@@ -5398,6 +5879,15 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
           preparePayload.orderType = orderPlan.orderType;
           preparePayload.price = orderPlan.price;
         }
+
+        // Check for duplicate orders before preparing (bot execution)
+        const duplicateReason = checkOrderDuplicate(preparePayload);
+        if (duplicateReason) {
+          pushBotExecutionAuditLog(symbol, "DUPLICATE_BLOCKED", duplicateReason);
+          failures.push(`${formatPairLabel(symbol)}: ${duplicateReason}`);
+          continue;
+        }
+
         pushBotExecutionAuditLog(
           symbol,
           "PREPARE_SENT",
@@ -5421,6 +5911,8 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
           tradeCommandBusyRef.current = false;
           continue;
         }
+        // Register the order since prepare succeeded
+        registerOrderExecution(preparePayload);
         pushBotExecutionAuditLog(
           symbol,
           "PREPARE_OK",
@@ -5455,6 +5947,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
           tradeCommandBusyRef.current = false;
           continue;
         }
+        clearRegisteredOrder(preparePayload);
         pushBotExecutionAuditLog(
           symbol,
           "EXECUTION_OK",
@@ -5560,9 +6053,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   }, [
     autoRuntimeMode,
     autoTradeEnabled,
+    autoSideFilter,
     autoMinConfidence,
     autoMinWinRate,
     autoMinRR,
+    autoMaxSpreadPointsSetting,
     autoCooldownMin,
     autoMaxOpenTrades,
     autoRequireStrongSignal,
@@ -5585,6 +6080,8 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     autoRiskPct,
     autoRiskUsd,
     autoRiskGuardMult,
+    autoMinSlPoints,
+    autoAtrBufferMult,
     autoDynamicMinLot,
     autoDynamicLotStep,
     panelSymbols,
@@ -5602,9 +6099,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     panelSymbols,
     panelTimeframes,
     panelAnalysis,
+    autoSideFilter,
     autoMinConfidence,
     autoMinWinRate,
     autoMinRR,
+    autoMaxSpreadPointsSetting,
     autoCooldownMin,
     autoMaxOpenTrades,
     autoRequireStrongSignal,
@@ -5615,6 +6114,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     autoStrategyMode,
     autoScalpAggressive,
     autoSessionGateEnabled,
+    autoEntryTimeframe,
     autoTradeTimeframeOverride,
     autoEntryMode,
     autoAllowMarketFallback,
@@ -5626,6 +6126,8 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     autoRiskPct,
     autoRiskUsd,
     autoRiskGuardMult,
+    autoMinSlPoints,
+    autoAtrBufferMult,
     autoDynamicMinLot,
     autoDynamicLotStep,
   ]);
@@ -5677,6 +6179,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     protectOvernightEnabled,
     protectOvernightProfitUsd,
     protectOvernightLossUsd,
+    protectBiasFlipProfitLockEnabled,
+    protectBiasFlipTpProgressPct,
+    protectOvernightProfitRetraceLockEnabled,
+    protectOvernightProfitRetraceArmUsd,
+    protectOvernightProfitRetraceCloseUsd,
     protectTimeframe,
     protectAtrPeriod,
     protectAtrMult,
@@ -6803,7 +7310,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                       }
                       className="px-2 py-1 text-[11px] rounded border border-emerald-400/60 bg-emerald-400/10 text-emerald-200 hover:bg-emerald-400/20"
                     >
-                      Apply
+                      Sync Now
                     </button>
                     <button
                       type="button"
@@ -6819,7 +7326,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                     <div className="rounded border border-slate-700 bg-slate-900/40 p-3">
                       <p className="text-xs font-semibold text-cyan-200 mb-2">Primary Setup</p>
                       <p className="text-[11px] text-slate-400 mb-3">
-                        Keep the setup simple: choose the strategy, choose the entry behavior, and adjust only the main trade filters.
+                        Keep the setup simple: choose the strategy, choose the entry behavior, and adjust only the main trade filters. Changes auto-sync to the active runtime and local storage.
                       </p>
                       <div className="grid md:grid-cols-2 xl:grid-cols-3 gap-3">
                         <label className="text-xs" title="Select account contract profile used for symbol suffix and risk assumptions.">
@@ -6852,6 +7359,24 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                           >
                             <option value="SCALP_M15">Scalper (M15 -&gt; M1/M5)</option>
                             <option value="CLASSIC_STACK">Classic (H4/H1 + Entry)</option>
+                          </select>
+                        </label>
+
+                        <label className="text-xs" title="Limit auto-trading to buy-only, sell-only, or allow both sides.">
+                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Trade Side</span>
+                          <select
+                            value={autoTradeDraft.sideFilter}
+                            onChange={(e) =>
+                              setAutoTradeDraft((prev) => ({
+                                ...prev,
+                                sideFilter: e.target.value as AutoSideFilter,
+                              }))
+                            }
+                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
+                          >
+                            <option value="BOTH">Both</option>
+                            <option value="BUY_ONLY">Buy only</option>
+                            <option value="SELL_ONLY">Sell only</option>
                           </select>
                         </label>
 
@@ -6905,6 +7430,24 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                           </select>
                         </label>
 
+                        <label className="text-xs" title="Post-cooldown confirmation profile applied before the bot can re-enter a symbol.">
+                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Re-entry Mode</span>
+                          <select
+                            value={autoTradeDraft.reentryMode}
+                            onChange={(e) =>
+                              setAutoTradeDraft((prev) => ({
+                                ...prev,
+                                reentryMode: e.target.value as AutoReentryMode,
+                              }))
+                            }
+                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
+                          >
+                            <option value="OFF">Off</option>
+                            <option value="BALANCED">Balanced</option>
+                            <option value="STRICT">Strict</option>
+                          </select>
+                        </label>
+
                         <label className="text-xs" title="MARKET executes immediately at current price. LIMIT @ S/R places pending limit orders near support or resistance.">
                           <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Entry Mode</span>
                           <select
@@ -6933,12 +7476,34 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                           />
                         </label>
 
+                        <label className="text-xs" title="Minimum modeled win rate required before auto-trade can execute.">
+                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Min Win Rate %</span>
+                          <input
+                            value={autoTradeDraft.minWinRate}
+                            onChange={(e) =>
+                              setAutoTradeDraft((prev) => ({ ...prev, minWinRate: e.target.value }))
+                            }
+                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
+                          />
+                        </label>
+
                         <label className="text-xs" title="Minimum reward-to-risk ratio required by policy.">
                           <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Min R:R</span>
                           <input
                             value={autoTradeDraft.minRR}
                             onChange={(e) =>
                               setAutoTradeDraft((prev) => ({ ...prev, minRR: e.target.value }))
+                            }
+                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
+                          />
+                        </label>
+
+                        <label className="text-xs" title="Base spread guard in points before symbol multipliers are applied. Gold uses a 1.25x multiplier on top of this value.">
+                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Max Spread Points</span>
+                          <input
+                            value={autoTradeDraft.maxSpreadPoints}
+                            onChange={(e) =>
+                              setAutoTradeDraft((prev) => ({ ...prev, maxSpreadPoints: e.target.value }))
                             }
                             className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
                           />
@@ -7004,6 +7569,17 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                           />
                         </label>
 
+                        <label className="text-xs" title="Base lot size for the bot. With dynamic lot ON this acts as the maximum lot cap. With dynamic lot OFF this becomes the fixed lot used for each trade.">
+                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Default Bot Lots</span>
+                          <input
+                            value={autoTradeDraft.botLots}
+                            onChange={(e) =>
+                              setAutoTradeDraft((prev) => ({ ...prev, botLots: e.target.value }))
+                            }
+                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
+                          />
+                        </label>
+
                         <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="When LIMIT @ S/R cannot build a valid pending order, allow guarded fallback to MARKET entry.">
                           <input
                             type="checkbox"
@@ -7013,6 +7589,17 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                             }
                           />
                           Allow market fallback
+                        </label>
+
+                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="Turn ON to let the bot calculate lot size from your risk settings. Turn OFF to use Default Bot Lots as a fixed lot per trade.">
+                          <input
+                            type="checkbox"
+                            checked={autoTradeDraft.useDynamicLot}
+                            onChange={(e) =>
+                              setAutoTradeDraft((prev) => ({ ...prev, useDynamicLot: e.target.checked }))
+                            }
+                          />
+                          Dynamic Lot ON/OFF
                         </label>
 
                         <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="If disabled, time-window session gate is bypassed.">
@@ -7057,6 +7644,54 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                           Auto Protect
                         </label>
 
+                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="When opposite bias appears, only close automatically after the trade has already progressed far enough toward TP.">
+                          <input
+                            type="checkbox"
+                            checked={protectBiasFlipProfitLockEnabled}
+                            onChange={(e) => setProtectBiasFlipProfitLockEnabled(e.target.checked)}
+                          />
+                          Bias Flip Profit Lock
+                        </label>
+
+                        <label className="text-xs" title="Minimum TP progress required before an opposite strong signal can lock in profit and close the trade.">
+                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>TP Progress %</span>
+                          <input
+                            value={protectBiasFlipTpProgressPct}
+                            disabled={!protectBiasFlipProfitLockEnabled}
+                            onChange={(e) => setProtectBiasFlipTpProgressPct(e.target.value)}
+                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white disabled:opacity-50"
+                          />
+                        </label>
+
+                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="For overnight trades, arm a profit lock after open PnL reaches a threshold, then close if too much of that profit is given back.">
+                          <input
+                            type="checkbox"
+                            checked={protectOvernightProfitRetraceLockEnabled}
+                            onChange={(e) => setProtectOvernightProfitRetraceLockEnabled(e.target.checked)}
+                          />
+                          Overnight Profit Retrace Lock
+                        </label>
+
+                        <label className="text-xs" title="Arm the overnight retrace lock once floating profit reaches this USD amount.">
+                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Retrace Arm USD</span>
+                          <input
+                            value={protectOvernightProfitRetraceArmUsd}
+                            disabled={!protectOvernightProfitRetraceLockEnabled}
+                            onChange={(e) => setProtectOvernightProfitRetraceArmUsd(e.target.value)}
+                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white disabled:opacity-50"
+                          />
+                        </label>
+
+                        <label className="text-xs" title="After the retrace lock is armed, close the overnight trade if floating profit falls back to this USD amount or lower.">
+                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Retrace Close USD</span>
+                          <input
+                            value={protectOvernightProfitRetraceCloseUsd}
+                            disabled={!protectOvernightProfitRetraceLockEnabled}
+                            onChange={(e) => setProtectOvernightProfitRetraceCloseUsd(e.target.value)}
+                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white disabled:opacity-50"
+                          />
+                        </label>
+
                         <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="Keep scanning and close open positions automatically once floating profit reaches the USD target.">
                           <input
                             type="checkbox"
@@ -7094,7 +7729,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                           : "Standard account uses the # symbols. Advanced lot and risk guard parameters stay on the managed defaults."}
                       </div>
                       <div className="mt-2 text-[11px] text-slate-400">
-                        Risk target applies to stop-loss exposure when dynamic lot sizing is on.
+                        Risk target applies to stop-loss exposure when dynamic lot sizing is on. If Dynamic Lot is off, Default Bot Lots becomes the fixed lot per trade.
                       </div>
                     </div>
 
@@ -7109,6 +7744,15 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                               </p>
                             ))}
                           </div>
+                        </div>
+                      )}
+
+                      {hasUnappliedTradeSettings && (
+                        <div className="rounded border border-cyan-500/40 bg-cyan-500/10 p-2">
+                          <p className="text-xs font-semibold text-cyan-200 mb-1">Unapplied Changes</p>
+                          <p className="text-[11px] text-cyan-100">
+                            The visible Trading Settings draft differs from the active applied settings. Click `Apply` to sync browser checks, saved local settings, and headless payload.
+                          </p>
                         </div>
                       )}
 
@@ -7143,6 +7787,17 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                           </p>
                         </div>
                       )}
+
+                      <div className="rounded border border-slate-600 bg-slate-900/50 p-2">
+                        <p className="text-xs font-semibold text-slate-200 mb-1">Re-entry Profile</p>
+                        <p className="text-[11px] text-slate-300">
+                          {autoTradeDraft.reentryMode === "OFF"
+                            ? "Cooldown still applies, but no extra M5/M1 re-entry confirmation is required after it expires."
+                            : autoTradeDraft.reentryMode === "STRICT"
+                            ? "Strict mode requires 4/4 closed M5 candles aligned with bias, plus latest closed M1 signal, candle direction, and EMA50 alignment."
+                            : "Balanced mode requires 3/4 closed M5 candles plus net move in bias direction, then latest closed M1 signal and candle confirmation."}
+                        </p>
+                      </div>
 
                       <div className={`rounded p-2 ${autoTradeDraft.sessionGateEnabled ? "border border-cyan-500/30 bg-cyan-500/10" : "border border-amber-500/30 bg-amber-500/10"}`}>
                         <p className={`text-xs font-semibold mb-1 ${autoTradeDraft.sessionGateEnabled ? "text-cyan-200" : "text-amber-200"}`}>Session Gate</p>
@@ -7202,6 +7857,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         <p className="text-slate-400">Signal Gate</p>
                         <p className="text-slate-100">Win rate &gt;= {autoTradeDraft.minWinRate}%</p>
                         <p className="text-slate-300">{autoTradeDraft.requireStrong ? "STRONG only" : "Any signal strength"}</p>
+                        <p className="text-slate-300">Trade side {autoTradeDraft.sideFilter === "BOTH" ? "Both" : autoTradeDraft.sideFilter === "BUY_ONLY" ? "Buy only" : "Sell only"}</p>
                       </div>
                       <div className="rounded border border-slate-700 bg-slate-950/40 p-2">
                         <p className="text-slate-400">Risk Mode</p>
@@ -7227,6 +7883,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         <p className="text-slate-400">Cooldown Guard</p>
                         <p className="text-slate-100">Symbol cooldown {autoTradeDraft.enforceSymbolCooldown ? "ON" : "OFF"}</p>
                         <p className="text-slate-300">{autoTradeDraft.cooldownMin} minute wait per symbol</p>
+                        <p className="text-slate-300">Re-entry {autoTradeDraft.reentryMode}</p>
                       </div>
                       <div className="rounded border border-slate-700 bg-slate-950/40 p-2">
                         <p className="text-slate-400">Trend Filter</p>
@@ -7265,6 +7922,12 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         <p className="text-slate-400">Break-even / Exit</p>
                         <p className="text-slate-100">Break-even {protectBreakEvenEnabled ? `ON at +$${Number(protectBreakEvenProfitUsd || 0).toFixed(2)}` : "OFF"}</p>
                         <p className="text-slate-300">Opposite-signal close {protectDegradeCloseEnabled ? `ON at ${protectDegradeMinConfidence}%` : "OFF"}</p>
+                        <p className="text-slate-300">
+                          Bias-flip lock {protectBiasFlipProfitLockEnabled ? `ON at ${Number(protectBiasFlipTpProgressPct || 0).toFixed(0)}% TP progress` : "OFF"}
+                        </p>
+                        <p className="text-slate-300">
+                          Retrace lock {protectOvernightProfitRetraceLockEnabled ? `ON arm +$${Number(protectOvernightProfitRetraceArmUsd || 0).toFixed(2)} / close +$${Number(protectOvernightProfitRetraceCloseUsd || 0).toFixed(2)}` : "OFF"}
+                        </p>
                       </div>
                     </div>
                   </div>
@@ -7378,6 +8041,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                     <select
                       value={orderAction}
                       onChange={(e) => {
+                        if (pendingOrder) {
+                          clearRegisteredOrder(pendingOrder);
+                        }
                         setOrderAction(e.target.value as OrderAction);
                         setPendingOrder(null);
                         setTradeBridgeMessage("");
@@ -7644,6 +8310,10 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                 const panelKey = `${symbol}|${timeframe}`;
                 const diag = policyByPanel[panelKey];
                 const eligibility = autoEligibilityByPanel[panelKey];
+                const headlessAdvisory =
+                  isHeadlessMode &&
+                  (normalizeSymbol(symbol) !== normalizeSymbol(HEADLESS_GOLD_PRESET_SYMBOL) ||
+                    timeframe !== HEADLESS_GOLD_PRESET_TIMEFRAME);
                 const panelBlocked = eligibility !== undefined ? !eligibility.eligible : diag?.pass === false;
                 const panelPass = eligibility !== undefined ? eligibility.eligible : diag?.pass === true;
                 const failedCheck = diag?.checks?.find((check) => !check.ok);
@@ -7669,16 +8339,23 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                       <span className="text-slate-400">Auto: </span>
                       <span
                         className={
-                          eligibility === undefined
+                          headlessAdvisory
+                            ? "text-amber-300"
+                            : eligibility === undefined
                             ? "text-slate-400"
                             : eligibility.eligible
                             ? "text-emerald-300"
                             : "text-rose-300"
                         }
                       >
-                        {eligibility === undefined ? "N/A" : eligibility.eligible ? "ELIGIBLE" : "BLOCKED"}
+                        {headlessAdvisory ? "ADVISORY" : eligibility === undefined ? "N/A" : eligibility.eligible ? "ELIGIBLE" : "BLOCKED"}
                       </span>
                     </p>
+                    {headlessAdvisory ? (
+                      <p className="text-[11px] mb-1 text-amber-300">
+                        Headless runtime executes {HEADLESS_GOLD_PRESET_SYMBOL} {HEADLESS_GOLD_PRESET_TIMEFRAME} only. This panel is diagnostics only.
+                      </p>
+                    ) : null}
                     {eligibility?.scalpBias && autoStrategyMode === "SCALP_M15" && (
                       <p className="text-[11px] mb-1">
                         <span className="text-slate-400">M15 Bias: </span>

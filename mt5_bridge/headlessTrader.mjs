@@ -9,9 +9,11 @@ const DEFAULT_WATCHLIST = [
 ];
 const DEFAULT_AUTO_CONFIG = {
   enabled: true,
-  minConfidence: 80,
-  minWinRate: 70,
-  minRR: 1.8,
+  sideFilter: "BOTH",
+  minConfidence: 70,
+  minWinRate: 65,
+  minRR: 1.0,
+  maxSpreadPoints: 80,
   cooldownMin: 15,
   maxOpenTrades: 1,
   requireStrong: true,
@@ -21,11 +23,12 @@ const DEFAULT_AUTO_CONFIG = {
   biasTimeframe: "H4",
   setupTimeframe: "H1",
   entryTimeframe: "M5",
+  reentryMode: "BALANCED",
   timeframeOverride: "PANEL",
   entryMode: "MARKET",
-  allowMarketFallback: true,
-  fallbackMinConfidence: 82,
-  fallbackRrBuffer: 0.35,
+  allowMarketFallback: false,
+  fallbackMinConfidence: 70,
+  fallbackRrBuffer: 0.2,
   botLots: 0.1,
   riskMode: "USD",
   useDynamicLot: true,
@@ -59,9 +62,14 @@ const DEFAULT_PROTECT_CONFIG = {
   breakEvenProfitUsd: 0.3,
   degradeCloseEnabled: true,
   degradeMinConfidence: 82,
+  biasFlipProfitLockEnabled: true,
+  biasFlipTpProgressPct: 35,
+  overnightProfitRetraceLockEnabled: true,
+  overnightProfitRetraceArmUsd: 0.8,
+  overnightProfitRetraceCloseUsd: 0.4,
   overnightEnabled: true,
-  overnightProfitUsd: 1.1,
-  overnightLossUsd: 1.2,
+  overnightProfitUsd: 1.5,
+  overnightLossUsd: 1.5,
 };
 const ADAPTIVE_SESSIONS = ["ASIA", "LONDON", "OVERLAP", "NEW_YORK", "QUIET"];
 const MAX_RUNTIME_LOGS = 200;
@@ -182,6 +190,9 @@ const sanitizeWatchlist = (value, fallback = DEFAULT_WATCHLIST) => {
 
 const sanitizeAutoConfig = (value = {}, fallback = DEFAULT_AUTO_CONFIG) => ({
   enabled: parseBoolean(value.enabled, fallback.enabled),
+  sideFilter: ["BUY_ONLY", "SELL_ONLY", "BOTH"].includes(String(value.sideFilter || "").toUpperCase())
+    ? String(value.sideFilter).toUpperCase()
+    : fallback.sideFilter,
   minConfidence: parseNumber(value.minConfidence, fallback.minConfidence, 0, 100),
   minWinRate: parseNumber(value.minWinRate, fallback.minWinRate, 0, 100),
   minRR: parseNumber(value.minRR, fallback.minRR, 0.5, 20),
@@ -201,6 +212,9 @@ const sanitizeAutoConfig = (value = {}, fallback = DEFAULT_AUTO_CONFIG) => ({
     ).toUpperCase() === "M5"
       ? "M5"
       : "M15",
+  reentryMode: ["OFF", "BALANCED", "STRICT"].includes(String(value.reentryMode || "").toUpperCase())
+    ? String(value.reentryMode).toUpperCase()
+    : fallback.reentryMode,
   timeframeOverride:
     String(value.timeframeOverride || fallback.timeframeOverride).toUpperCase() === "PANEL"
       ? "PANEL"
@@ -215,6 +229,7 @@ const sanitizeAutoConfig = (value = {}, fallback = DEFAULT_AUTO_CONFIG) => ({
   riskPct: parseNumber(value.riskPct, fallback.riskPct, 0.01, 100),
   riskUsd: parseNumber(value.riskUsd, fallback.riskUsd, 0.01, 1000000),
   riskGuardMult: parseNumber(value.riskGuardMult, fallback.riskGuardMult, 1, 20),
+  maxSpreadPoints: parseNumber(value.maxSpreadPoints, fallback.maxSpreadPoints, 1, 100000),
   minSlPoints: parseNumber(value.minSlPoints, fallback.minSlPoints, 1, 100000),
   atrBufferMult: parseNumber(value.atrBufferMult, fallback.atrBufferMult, 0, 10),
   minLot: parseNumber(value.minLot, fallback.minLot, 0.001, 1000),
@@ -264,6 +279,24 @@ const sanitizeProtectConfig = (value = {}, fallback = DEFAULT_PROTECT_CONFIG) =>
   breakEvenProfitUsd: parseNumber(value.breakEvenProfitUsd, fallback.breakEvenProfitUsd, 0.01, 1000000),
   degradeCloseEnabled: parseBoolean(value.degradeCloseEnabled, fallback.degradeCloseEnabled),
   degradeMinConfidence: parseNumber(value.degradeMinConfidence, fallback.degradeMinConfidence, 0, 100),
+  biasFlipProfitLockEnabled: parseBoolean(value.biasFlipProfitLockEnabled, fallback.biasFlipProfitLockEnabled),
+  biasFlipTpProgressPct: parseNumber(value.biasFlipTpProgressPct, fallback.biasFlipTpProgressPct, 1, 100),
+  overnightProfitRetraceLockEnabled: parseBoolean(
+    value.overnightProfitRetraceLockEnabled,
+    fallback.overnightProfitRetraceLockEnabled
+  ),
+  overnightProfitRetraceArmUsd: parseNumber(
+    value.overnightProfitRetraceArmUsd,
+    fallback.overnightProfitRetraceArmUsd,
+    0.01,
+    1000000
+  ),
+  overnightProfitRetraceCloseUsd: parseNumber(
+    value.overnightProfitRetraceCloseUsd,
+    fallback.overnightProfitRetraceCloseUsd,
+    0.01,
+    1000000
+  ),
   overnightEnabled: parseBoolean(value.overnightEnabled, fallback.overnightEnabled),
   overnightProfitUsd: parseNumber(value.overnightProfitUsd, fallback.overnightProfitUsd, 0.01, 1000000),
   overnightLossUsd: parseNumber(value.overnightLossUsd, fallback.overnightLossUsd, 0.01, 1000000),
@@ -454,7 +487,7 @@ export const createHeadlessTrader = async (options) => {
     executeMt4Command,
   } = options;
 
-  const autoMaxSpreadPoints = Math.max(
+  const defaultAutoMaxSpreadPoints = Math.max(
     1,
     Number(env.AUTO_MAX_SPREAD_POINTS ?? env.VITE_AUTO_MAX_SPREAD_POINTS ?? env.VITE_AUTO_GOLD_MAX_SPREAD_POINTS ?? 80)
   );
@@ -538,6 +571,7 @@ export const createHeadlessTrader = async (options) => {
       lastTradeProfit: 0,
       processedTradeKeys: new Set(),
     },
+    overnightProfitRetraceState: new Map(),
     highImpactNewsCache: new Map(),
   };
 
@@ -720,7 +754,11 @@ export const createHeadlessTrader = async (options) => {
   };
 
   const getSpreadGuardPointsForSymbol = (symbol) =>
-    Math.max(1, autoMaxSpreadPoints * getSymbolExecutionPreset(symbol).spreadMult);
+    Math.max(
+      1,
+      (Math.max(1, Number(state.config.auto.maxSpreadPoints) || defaultAutoMaxSpreadPoints)) *
+        getSymbolExecutionPreset(symbol).spreadMult
+    );
 
   const getSlippageGuardPointsForSymbol = (symbol) =>
     Math.max(1, autoMaxSlippagePoints * getSymbolExecutionPreset(symbol).slippageMult);
@@ -782,51 +820,7 @@ export const createHeadlessTrader = async (options) => {
       .sort((a, b) => a.time - b.time);
   };
 
-  const computeHighImpactNewsBlock = async (symbol) => {
-    if (
-      !state.config.auto.highImpactNewsFilterEnabled ||
-      typeof fetchMarketIntelForSymbols !== "function" ||
-      !Array.isArray(state.config.auto.highImpactNewsKeywords) ||
-      !state.config.auto.highImpactNewsKeywords.length
-    ) {
-      return { blocked: false, reason: "" };
-    }
-
-    const cacheKey = `${normalizeSymbol(symbol)}|${state.config.auto.highImpactNewsKeywords.join("|")}|${state.config.auto.highImpactNewsLookbackMin}`;
-    const cached = state.highImpactNewsCache.get(cacheKey);
-    if (cached && Date.now() - cached.cachedAtMs < HIGH_IMPACT_NEWS_CACHE_MS) {
-      return cached.result;
-    }
-
-    try {
-      const result = await fetchMarketIntelForSymbols([symbol], 8);
-      const entries = result?.ok && Array.isArray(result.symbols) ? result.symbols : [];
-      const symbolEntry = entries.find((entry) => normalizeSymbol(entry.symbol) === normalizeSymbol(symbol));
-      const news = Array.isArray(symbolEntry?.news) ? symbolEntry.news : [];
-      const keywords = state.config.auto.highImpactNewsKeywords.map((item) => String(item || "").toUpperCase());
-      const lookbackMs = Number(state.config.auto.highImpactNewsLookbackMin) * 60 * 1000;
-      const nowMs = Date.now();
-      const matched = news.find((item) => {
-        const publishedMs = Date.parse(String(item?.publishedAt || ""));
-        if (!Number.isFinite(publishedMs) || nowMs - publishedMs > lookbackMs) return false;
-        const haystack = `${String(item?.title || "")} ${String(item?.summary || "")}`.toUpperCase();
-        return keywords.some((keyword) => haystack.includes(keyword));
-      });
-      const finalResult = matched
-        ? {
-            blocked: true,
-            reason: `High-impact news filter: ${matched.title || "macro event"} (${state.config.auto.highImpactNewsKeywords.join("/")})`,
-          }
-        : { blocked: false, reason: "" };
-      state.highImpactNewsCache.set(cacheKey, { cachedAtMs: nowMs, result: finalResult });
-      return finalResult;
-    } catch {
-      return { blocked: false, reason: "" };
-    }
-  };
-
-  const generatePriceData = async (symbol, timeframe) => {
-    const candles = await fetchCandles(symbol, timeframe, 320);
+  const buildPriceDataFromCandles = (symbol, candles) => {
     if (candles.length < 60) return null;
     const last = candles[candles.length - 1];
     const prev = candles[candles.length - 2];
@@ -874,6 +868,105 @@ export const createHeadlessTrader = async (options) => {
       movingAverage200SlopeAtrRatio: ma200SlopeAtrRatio,
       lastCandleTime: last.time,
     };
+  };
+
+  const computeHighImpactNewsBlock = async (symbol) => {
+    if (
+      !state.config.auto.highImpactNewsFilterEnabled ||
+      typeof fetchMarketIntelForSymbols !== "function" ||
+      !Array.isArray(state.config.auto.highImpactNewsKeywords) ||
+      !state.config.auto.highImpactNewsKeywords.length
+    ) {
+      return { blocked: false, reason: "" };
+    }
+
+    const cacheKey = `${normalizeSymbol(symbol)}|${state.config.auto.highImpactNewsKeywords.join("|")}|${state.config.auto.highImpactNewsLookbackMin}`;
+    const cached = state.highImpactNewsCache.get(cacheKey);
+    if (cached && Date.now() - cached.cachedAtMs < HIGH_IMPACT_NEWS_CACHE_MS) {
+      return cached.result;
+    }
+
+    try {
+      const result = await fetchMarketIntelForSymbols([symbol], 8);
+      const entries = result?.ok && Array.isArray(result.symbols) ? result.symbols : [];
+      const symbolEntry = entries.find((entry) => normalizeSymbol(entry.symbol) === normalizeSymbol(symbol));
+      const news = Array.isArray(symbolEntry?.news) ? symbolEntry.news : [];
+      const keywords = state.config.auto.highImpactNewsKeywords.map((item) => String(item || "").toUpperCase());
+      const lookbackMs = Number(state.config.auto.highImpactNewsLookbackMin) * 60 * 1000;
+      const nowMs = Date.now();
+      const matched = news.find((item) => {
+        const publishedMs = Date.parse(String(item?.publishedAt || ""));
+        if (!Number.isFinite(publishedMs) || nowMs - publishedMs > lookbackMs) return false;
+        const haystack = `${String(item?.title || "")} ${String(item?.summary || "")}`.toUpperCase();
+        return keywords.some((keyword) => haystack.includes(keyword));
+      });
+      const finalResult = matched
+        ? {
+            blocked: true,
+            reason: `High-impact news filter: ${matched.title || "macro event"} (${state.config.auto.highImpactNewsKeywords.join("/")})`,
+          }
+        : { blocked: false, reason: "" };
+      state.highImpactNewsCache.set(cacheKey, { cachedAtMs: nowMs, result: finalResult });
+      return finalResult;
+    } catch {
+      return { blocked: false, reason: "" };
+    }
+  };
+
+  const generatePriceData = async (symbol, timeframe) => {
+    const candles = await fetchCandles(symbol, timeframe, 320);
+    return buildPriceDataFromCandles(symbol, candles);
+  };
+
+  const evaluateCooldownReentryConfirmation = async (symbol, side) => {
+    const reentryMode = String(state.config.auto.reentryMode || "BALANCED").toUpperCase();
+    if (reentryMode === "OFF") {
+      return { ok: true, reason: "Re-entry confirmation disabled" };
+    }
+
+    const m5Candles = await fetchCandles(symbol, "M5", 12);
+    const closedM5 = m5Candles.slice(0, -1).slice(-4);
+    if (closedM5.length < 4) {
+      return { ok: false, reason: "M5 re-entry bias unavailable" };
+    }
+
+    const bullishM5 = closedM5.filter((candle) => candle.close > candle.open).length;
+    const bearishM5 = closedM5.filter((candle) => candle.close < candle.open).length;
+    const m5NetMove = closedM5[closedM5.length - 1].close - closedM5[0].open;
+    const requiredM5Count = reentryMode === "STRICT" ? 4 : 3;
+    const m5BiasOk = side === "BUY" ? bullishM5 >= requiredM5Count && m5NetMove > 0 : bearishM5 >= requiredM5Count && m5NetMove < 0;
+    if (!m5BiasOk) {
+      return {
+        ok: false,
+        reason:
+          `Previous 4 M5 candles do not support ${side} bias ` +
+          `(${side === "BUY" ? bullishM5 + "/4 bullish" : bearishM5 + "/4 bearish"}, need ${requiredM5Count}, net ${m5NetMove >= 0 ? "+" : ""}${m5NetMove.toFixed(5)})`,
+      };
+    }
+
+    const m1Candles = await fetchCandles(symbol, "M1", 90);
+    const closedM1 = m1Candles.slice(0, -1);
+    const m1Data = buildPriceDataFromCandles(symbol, closedM1);
+    const m1LastClosed = closedM1[closedM1.length - 1];
+    if (!m1Data || !m1LastClosed) {
+      return { ok: false, reason: "M1 confirmation unavailable" };
+    }
+
+    const m1Signal = generateTradeSignal(m1Data);
+    const m1CandleOk = side === "BUY" ? m1LastClosed.close > m1LastClosed.open : m1LastClosed.close < m1LastClosed.open;
+    const m1EmaOk =
+      side === "BUY" ? m1LastClosed.close >= m1Data.movingAverage50 : m1LastClosed.close <= m1Data.movingAverage50;
+    const requireEmaFilter = reentryMode === "STRICT";
+    if (!(m1Signal.signal === side && m1CandleOk && (!requireEmaFilter || m1EmaOk))) {
+      return {
+        ok: false,
+        reason:
+          `M1 confirmation does not match ${side} bias ` +
+          `(signal ${m1Signal.signal}, candle ${m1CandleOk ? "confirms" : "opposes"}${requireEmaFilter ? `, EMA50 ${m1EmaOk ? "aligned" : "not aligned"}` : ""})`,
+      };
+    }
+
+    return { ok: true, reason: `M5 bias and M1 confirmation aligned for ${side}` };
   };
 
   const generateTradeSignal = (data) => {
@@ -1189,6 +1282,15 @@ export const createHeadlessTrader = async (options) => {
     if (!orderPlan) {
       return { eligible: false, reason: orderPlanResult.blockedReason || "No valid order plan" };
     }
+    if (
+      (state.config.auto.sideFilter === "BUY_ONLY" && orderPlan.side !== "BUY") ||
+      (state.config.auto.sideFilter === "SELL_ONLY" && orderPlan.side !== "SELL")
+    ) {
+      return {
+        eligible: false,
+        reason: `Side filter blocked ${orderPlan.side} (${state.config.auto.sideFilter})`,
+      };
+    }
 
     let strategyBlockReason = null;
     if (signal.confidence < Number(state.config.auto.minConfidence)) {
@@ -1216,7 +1318,12 @@ export const createHeadlessTrader = async (options) => {
       Number(dataForOrder.movingAverage200SlopeAtrRatio) > Number(state.config.auto.ma200FlatMaxAtrRatio) &&
       !strategyBlockReason
     ) {
-      strategyBlockReason = `MA200 trend too strong (${Number(dataForOrder.movingAverage200SlopeAtrRatio).toFixed(2)} ATR slope)`;
+      strategyBlockReason =
+        `MA200 trend too strong (` +
+        `MA200 ${Number(dataForOrder.movingAverage200).toFixed(2)} vs prev ${Number(dataForOrder.movingAverage200Prev).toFixed(2)}, ` +
+        `slope ${Number(dataForOrder.movingAverage200Slope).toFixed(2)}, ` +
+        `ATR ratio ${Number(dataForOrder.movingAverage200SlopeAtrRatio).toFixed(2)} > ${Number(state.config.auto.ma200FlatMaxAtrRatio).toFixed(2)}` +
+        `)`;
     }
     if (currentOpenCount >= Number(state.config.auto.maxOpenTrades) && !strategyBlockReason) {
       strategyBlockReason = `Max active positions reached (${currentOpenCount}/${state.config.auto.maxOpenTrades})`;
@@ -1265,6 +1372,13 @@ export const createHeadlessTrader = async (options) => {
       strategyBlockReason = `Trend filter blocked ${orderPlan.side} (${trendFrames
         .map((frame) => `${frame}=${trendState[frame]}`)
         .join(", ")})`;
+    }
+
+    if (!strategyBlockReason) {
+      const reentryConfirmation = await evaluateCooldownReentryConfirmation(symbol, orderPlan.side);
+      if (!reentryConfirmation.ok) {
+        strategyBlockReason = reentryConfirmation.reason;
+      }
     }
 
     if (liveTick) {
@@ -1624,6 +1738,7 @@ export const createHeadlessTrader = async (options) => {
       const openResult = await listOpenPositions();
       const positions = openResult.ok && Array.isArray(openResult.positions) ? openResult.positions : [];
       if (!positions.length) {
+        state.overnightProfitRetraceState.clear();
         state.protectStatus = state.overnightLossGuard.active
           ? `Headless protect paused: ${state.overnightLossGuard.stopReason || "overnight loss-stop active"}`
           : "Headless protect: no open positions";
@@ -1639,6 +1754,21 @@ export const createHeadlessTrader = async (options) => {
       const overnightProfitUsd = Number(state.config.protect.overnightProfitUsd);
       const overnightLossUsd = Number(state.config.protect.overnightLossUsd);
       const breakEvenProfitUsd = Number(state.config.protect.breakEvenProfitUsd);
+      const overnightProfitRetraceLockEnabled = Boolean(state.config.protect.overnightProfitRetraceLockEnabled);
+      const overnightProfitRetraceArmUsd = Math.max(
+        0.01,
+        Number(state.config.protect.overnightProfitRetraceArmUsd) || 0.8
+      );
+      const overnightProfitRetraceCloseUsd = Math.max(
+        0.01,
+        Number(state.config.protect.overnightProfitRetraceCloseUsd) || 0.4
+      );
+      const openTickets = new Set(positions.map((position) => String(position.ticket)));
+      for (const ticket of Array.from(state.overnightProfitRetraceState.keys())) {
+        if (!openTickets.has(String(ticket))) {
+          state.overnightProfitRetraceState.delete(ticket);
+        }
+      }
 
       for (const position of positions) {
         const side = String(position.type || "").toUpperCase();
@@ -1646,7 +1776,7 @@ export const createHeadlessTrader = async (options) => {
         const tick = await fetchTick(position.symbol);
 
         let floatingPnl = Number.NaN;
-        if (state.config.protect.overnightEnabled && tick) {
+        if (tick) {
           let spec = specCache.get(position.symbol);
           if (spec === undefined) {
             const specResult = await readMt4SymbolSpecs({ symbol: position.symbol });
@@ -1677,7 +1807,23 @@ export const createHeadlessTrader = async (options) => {
               side === "BUY"
                 ? (closePrice - entry) * moneyPerPricePerLot * lots
                 : (entry - closePrice) * moneyPerPricePerLot * lots;
-            if (Number.isFinite(floatingPnl) && overnightLossUsd > 0 && floatingPnl <= -Math.abs(overnightLossUsd)) {
+            if (state.config.protect.overnightEnabled && Number.isFinite(floatingPnl)) {
+              const retraceState = state.overnightProfitRetraceState.get(position.ticket) || {
+                armed: false,
+                peakProfitUsd: Number.NEGATIVE_INFINITY,
+              };
+              retraceState.peakProfitUsd = Math.max(retraceState.peakProfitUsd, floatingPnl);
+              if (!retraceState.armed && retraceState.peakProfitUsd >= overnightProfitRetraceArmUsd) {
+                retraceState.armed = true;
+              }
+              state.overnightProfitRetraceState.set(position.ticket, retraceState);
+            }
+            if (
+              state.config.protect.overnightEnabled &&
+              Number.isFinite(floatingPnl) &&
+              overnightLossUsd > 0 &&
+              floatingPnl <= -Math.abs(overnightLossUsd)
+            ) {
               const closeResult = await executeValidatedRequest(
                 {
                   action: "CLOSE",
@@ -1699,7 +1845,11 @@ export const createHeadlessTrader = async (options) => {
               }
               failures.push(`${position.symbol}: ${closeResult.error || "overnight loss close failed"}`);
             }
-            if (Number.isFinite(floatingPnl) && floatingPnl >= overnightProfitUsd) {
+            if (
+              state.config.protect.overnightEnabled &&
+              Number.isFinite(floatingPnl) &&
+              floatingPnl >= overnightProfitUsd
+            ) {
               const closeResult = await executeValidatedRequest(
                 {
                   action: "CLOSE",
@@ -1721,10 +1871,41 @@ export const createHeadlessTrader = async (options) => {
               }
               failures.push(`${position.symbol}: ${closeResult.error || "overnight close failed"}`);
             }
+            const retraceState = state.overnightProfitRetraceState.get(position.ticket);
+            if (
+              state.config.protect.overnightEnabled &&
+              overnightProfitRetraceLockEnabled &&
+              retraceState?.armed &&
+              Number.isFinite(floatingPnl) &&
+              floatingPnl > 0 &&
+              floatingPnl <= overnightProfitRetraceCloseUsd
+            ) {
+              const closeResult = await executeValidatedRequest(
+                {
+                  action: "CLOSE",
+                  ticket: position.ticket,
+                  lots: position.lots,
+                },
+                {
+                  symbol: position.symbol,
+                  successStage: "EXECUTION_OK",
+                  successMessage: `${position.symbol} #${position.ticket} closed by overnight retrace lock`,
+                  failureStage: "EXECUTION_FAIL",
+                }
+              );
+              if (closeResult.ok) {
+                closures.push(
+                  `${position.symbol} #${position.ticket} closed by overnight retrace lock (armed at +$${overnightProfitRetraceArmUsd.toFixed(2)}, retraced to +$${floatingPnl.toFixed(2)})`
+                );
+                state.overnightProfitRetraceState.delete(position.ticket);
+                continue;
+              }
+              failures.push(`${position.symbol}: ${closeResult.error || "overnight retrace close failed"}`);
+            }
           }
         }
 
-        if (state.config.protect.breakEvenEnabled && Number.isFinite(tick?.mid)) {
+        if (state.config.protect.enabled && state.config.protect.breakEvenEnabled && Number.isFinite(tick?.mid)) {
           const current = Number(tick.mid);
           const pointSize = getPointSizeForSymbol(position.symbol, current);
           const minDistance = Number(state.config.protect.minStopPoints) * pointSize;
@@ -1817,26 +1998,49 @@ export const createHeadlessTrader = async (options) => {
             ((side === "BUY" && protectSignal.signal === "SELL") ||
               (side === "SELL" && protectSignal.signal === "BUY"));
           if (isOpposite && (protectSignal?.confidence || 0) >= Number(state.config.protect.degradeMinConfidence)) {
-            const closeResult = await executeValidatedRequest(
-              {
-                action: "CLOSE",
-                ticket: position.ticket,
-                lots: position.lots,
-              },
-              {
-                symbol: position.symbol,
-                successStage: "EXECUTION_OK",
-                successMessage: `${position.symbol} #${position.ticket} closed by degrade-close`,
-                failureStage: "EXECUTION_FAIL",
-              }
-            );
-            if (closeResult.ok) {
-              closures.push(
-                `${position.symbol} #${position.ticket} closed (opposite ${protectSignal.signal} ${protectSignal.confidence.toFixed(0)}%)`
+            const tp = Number(position.tp);
+            const entry = Number(position.openPrice);
+            const tpDistance =
+              side === "BUY" ? tp - entry : entry - tp;
+            const favorableDistance =
+              side === "BUY" ? current - entry : entry - current;
+            const tpProgressPct =
+              Number.isFinite(tpDistance) && tpDistance > 0 && Number.isFinite(favorableDistance)
+                ? (favorableDistance / tpDistance) * 100
+                : Number.NaN;
+            const biasFlipProfitLockEnabled = Boolean(state.config.protect.biasFlipProfitLockEnabled);
+            const biasFlipTpProgressPct = Math.max(1, Number(state.config.protect.biasFlipTpProgressPct) || 35);
+            const eligibleForProfitLock =
+              biasFlipProfitLockEnabled &&
+              Number.isFinite(floatingPnl) &&
+              floatingPnl > 0 &&
+              Number.isFinite(tpProgressPct) &&
+              tpProgressPct >= biasFlipTpProgressPct;
+
+            if (eligibleForProfitLock || !biasFlipProfitLockEnabled) {
+              const closeResult = await executeValidatedRequest(
+                {
+                  action: "CLOSE",
+                  ticket: position.ticket,
+                  lots: position.lots,
+                },
+                {
+                  symbol: position.symbol,
+                  successStage: "EXECUTION_OK",
+                  successMessage: `${position.symbol} #${position.ticket} closed by ${eligibleForProfitLock ? "bias-flip profit lock" : "degrade-close"}`,
+                  failureStage: "EXECUTION_FAIL",
+                }
               );
-              continue;
+              if (closeResult.ok) {
+                closures.push(
+                  eligibleForProfitLock
+                    ? `${position.symbol} #${position.ticket} closed by bias-flip profit lock (${tpProgressPct.toFixed(0)}% TP progress, opposite ${protectSignal.signal} ${protectSignal.confidence.toFixed(0)}%)`
+                    : `${position.symbol} #${position.ticket} closed (opposite ${protectSignal.signal} ${protectSignal.confidence.toFixed(0)}%)`
+                );
+                continue;
+              }
+              failures.push(`${position.symbol}: ${closeResult.error || "close failed"}`);
             }
-            failures.push(`${position.symbol}: ${closeResult.error || "close failed"}`);
           }
         }
 
