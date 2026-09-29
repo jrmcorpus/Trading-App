@@ -1,0 +1,167 @@
+{
+  "repo": "Trading-App",
+  "generated_for": [
+    "frontend-runtime",
+    "mt4-bridge",
+    "headless-trader",
+    "mt4-ea"
+  ],
+  "recommended_skills": [
+    {
+      "name": "trading-app-runtime-ops",
+      "priority": "P1",
+      "purpose": "Operate, restart, and verify the local frontend plus bridge runtime.",
+      "triggers": [
+        "app not loading",
+        "restart the stack",
+        "verify runtime",
+        "check live endpoints"
+      ],
+      "key_files": [
+        "package.json",
+        "scripts/start-app.ps1",
+        "scripts/stop-app.ps1",
+        "vite.config.ts",
+        "mt5_bridge/server.mjs"
+      ],
+      "commands": [
+        "npm.cmd run app:up",
+        "npm.cmd run app:down",
+        "Invoke-RestMethod http://localhost:3000/index.html",
+        "Invoke-RestMethod http://localhost:8787/health",
+        "Invoke-RestMethod http://localhost:8787/api/mt4/headless/status"
+      ]
+    },
+    {
+      "name": "mt4-bridge-diagnostics",
+      "priority": "P1",
+      "purpose": "Diagnose MT4 export, bridge parsing, and bridge API consistency problems.",
+      "triggers": [
+        "candles wrong",
+        "ticks mismatch",
+        "history missing",
+        "orders missing",
+        "symbol feed broken"
+      ],
+      "key_files": [
+        "mt5_bridge/server.mjs",
+        "mt5_bridge/MT4_Execution_EA.mq4",
+        "mt5_bridge/MT4_Candle_Exporter.mq4",
+        "mt5_bridge/MT4_EXECUTION_EA_GUIDE.md"
+      ],
+      "endpoints": [
+        "/api/mt4/candles",
+        "/api/mt4/ticks",
+        "/api/mt4/orders/open",
+        "/api/mt4/history",
+        "/api/mt4/headless/status"
+      ]
+    },
+    {
+      "name": "headless-trader-tuner",
+      "priority": "P1",
+      "purpose": "Tune live strategy behavior, order planning, confidence thresholds, TP/SL rules, and symbol profiles.",
+      "triggers": [
+        "make it more aggressive",
+        "bot not trading",
+        "TP too far",
+        "SL too close",
+        "change market vs limit"
+      ],
+      "key_files": [
+        "mt5_bridge/headlessTrader.mjs",
+        "mt5_bridge/headless-config.json",
+        "src/components/TradingAssistant.tsx"
+      ],
+      "hotspots": [
+        "getEffectiveAutoConfig",
+        "buildAutoOrderPlan",
+        "evaluateTradeCandidate",
+        "buildMissingProtectionPlan"
+      ]
+    },
+    {
+      "name": "managed-symbol-policy-auditor",
+      "priority": "P1",
+      "purpose": "Explain why GOLD or ETHUSD did or did not trade, using effective symbol-profile logic.",
+      "triggers": [
+        "why GOLD blocked",
+        "why ETH blocked",
+        "panel says blocked",
+        "runtime mismatch"
+      ],
+      "key_files": [
+        "src/components/TradingAssistant.tsx",
+        "mt5_bridge/headlessTrader.mjs",
+        "mt5_bridge/headless-config.json"
+      ]
+    },
+    {
+      "name": "manual-trade-protect-manager",
+      "priority": "P2",
+      "purpose": "Manage and explain how the app modifies manual MT4 trades after fill.",
+      "triggers": [
+        "manual trade changed",
+        "TP auto-filled",
+        "SL moved to BE",
+        "manual trade closed weirdly"
+      ],
+      "key_files": [
+        "src/components/TradingAssistant.tsx",
+        "mt5_bridge/headlessTrader.mjs",
+        "mt5_bridge/server.mjs"
+      ]
+    },
+    {
+      "name": "broker-symbol-resolution-auditor",
+      "priority": "P2",
+      "purpose": "Resolve broker symbol family mismatches across UI, bridge, and execution.",
+      "triggers": [
+        "GOLD vs GOLDm#",
+        "price mismatch",
+        "S/R wrong scale",
+        "symbol mapping issue"
+      ],
+      "key_files": [
+        "mt5_bridge/server.mjs",
+        "src/components/TradingAssistant.tsx",
+        "src/utils/pairs.ts"
+      ]
+    },
+    {
+      "name": "frontend-trading-panel-editor",
+      "priority": "P2",
+      "purpose": "Change the settings modal, diagnostics panels, and strategy UI while staying aligned with runtime truth.",
+      "triggers": [
+        "settings broken",
+        "panel label wrong",
+        "UI mismatch",
+        "make settings per symbol"
+      ],
+      "key_files": [
+        "src/components/TradingAssistant.tsx",
+        "src/App.tsx",
+        "src/components/PriceChart.tsx"
+      ],
+      "commands": [
+        "npm.cmd run type-check"
+      ]
+    },
+    {
+      "name": "trade-history-and-policy-reviewer",
+      "priority": "P3",
+      "purpose": "Interpret trade history, close reasons, tags, policy checks, and audit events.",
+      "triggers": [
+        "why closed",
+        "manual close vs bot close",
+        "cooldown started again",
+        "history label wrong"
+      ],
+      "key_files": [
+        "src/App.tsx",
+        "mt5_bridge/server.mjs",
+        "mt5_bridge/headlessTrader.mjs"
+      ]
+    }
+  ]
+}

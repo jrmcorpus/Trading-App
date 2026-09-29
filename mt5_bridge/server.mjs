@@ -41,6 +41,11 @@ loadEnvFromFile(path.resolve(cwd, ".env.local"));
 const PORT = Number(process.env.MT5_BRIDGE_PORT || 8787);
 const PYTHON_BIN = process.env.MT5_BRIDGE_PYTHON || "python";
 const scriptPath = path.resolve(process.cwd(), "mt5_bridge", "fetch_mt5_rates.py");
+const mt5AdapterPath = path.resolve(process.cwd(), "mt5_bridge", "mt5_adapter.py");
+const MT5_NATIVE_MODE = String(process.env.MT5_BRIDGE_MODE || "native").trim().toLowerCase() === "native";
+const MT5_TRADING_ENABLED = ["1", "true", "yes", "on", "enabled"].includes(
+  String(process.env.MT5_TRADING_ENABLED || "false").trim().toLowerCase()
+);
 const HEADLESS_CONFIG_PATH =
   process.env.MT4_HEADLESS_CONFIG_FILE || path.resolve(process.cwd(), "mt5_bridge", "headless-config.json");
 
@@ -177,6 +182,40 @@ const runFetcher = ({ symbol, timeframe, count }) =>
         resolve({ ok: false, error: `Invalid JSON from MT5 fetcher: ${err instanceof Error ? err.message : String(err)}` });
       }
     });
+  });
+
+const runMt5Adapter = ({ action, ...payload }) =>
+  new Promise((resolve) => {
+    const child = spawn(PYTHON_BIN, [mt5AdapterPath], { stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+
+    child.on("error", (err) => {
+      resolve({ ok: false, error: `MT5 adapter process failed: ${err.message}` });
+    });
+
+    child.on("close", () => {
+      try {
+        const parsed = JSON.parse(stdout || "{}");
+        if (parsed && typeof parsed === "object") {
+          resolve(parsed);
+          return;
+        }
+      } catch {
+        // Return a sanitized process-boundary error below.
+      }
+      resolve({ ok: false, error: stderr.trim() || "MT5 adapter returned invalid JSON" });
+    });
+
+    child.stdin.end(JSON.stringify({ action, ...payload }));
   });
 
 const mt4SymbolCandidates = (symbol) => {
@@ -334,9 +373,23 @@ const findMt4FileBySymbol = async (symbolCandidates, tf) => {
 };
 
 const readMt4Candles = async ({ symbol, timeframe, count }) => {
+  if (MT5_NATIVE_MODE) {
+    return runMt5Adapter({
+      action: "candles",
+      symbol,
+      timeframe: String(timeframe || "D1").toUpperCase(),
+      count: Number.isFinite(count) ? count : 300,
+    });
+  }
+
   try {
     const tf = String(timeframe || "D1").toUpperCase();
-    const candidates = mt4SymbolCandidates(symbol);
+    const resolvedExecutable = await resolveExecutableSymbol(symbol);
+    const preferredSymbol = resolvedExecutable.ok && resolvedExecutable.symbol ? resolvedExecutable.symbol : symbol;
+    const candidates = Array.from(new Set([
+      String(preferredSymbol || "").trim().toUpperCase(),
+      ...mt4SymbolCandidates(symbol),
+    ].filter(Boolean)));
     const match = await findMt4FileBySymbol(candidates, tf);
     const fullPath = match?.fullPath ?? null;
     const resolvedSymbol = match?.resolvedSymbol ?? null;
@@ -485,6 +538,10 @@ const waitForResult = async (requestId, timeoutMs) => {
 };
 
 const executeMt4Command = async (request) => {
+  if (MT5_NATIVE_MODE) {
+    return runMt5Adapter({ action: "execute", request });
+  }
+
   await ensureMt4Dir();
 
   const cmdPath = commandPath();
@@ -524,6 +581,7 @@ const resolveExecutableSymbol = async (symbol) => {
   }
 
   const specs = specsResult.specs
+    .filter((spec) => !MT5_NATIVE_MODE || Number(spec?.tradeMode ?? 4) !== 0)
     .map((spec) => String(spec?.symbol || "").trim())
     .filter(Boolean);
   const specUpper = specs.map((spec) => spec.toUpperCase());
@@ -746,6 +804,16 @@ const evaluatePlaceRiskPolicy = async (request) => {
     if (token.length >= 7 && token.endsWith("M")) return token.slice(0, -1);
     return token;
   };
+  const collectCooldownCommentPrefixes = (commentValue) => {
+    const raw = String(commentValue || "").trim();
+    if (!raw) return [];
+    const prefixes = [raw];
+    const timeframeStripped = raw.replace(/-(M\d+|H\d+|D1|W1|MN)$/i, "");
+    if (timeframeStripped && timeframeStripped !== raw) {
+      prefixes.push(timeframeStripped);
+    }
+    return Array.from(new Set(prefixes.map((item) => item.trim()).filter(Boolean)));
+  };
 
   if (request.action !== "PLACE" && request.action !== "PENDING") {
     addCheck("action", true, "No PLACE-specific policy required");
@@ -772,6 +840,7 @@ const evaluatePlaceRiskPolicy = async (request) => {
   const accountResult = await readMt4AccountSnapshot();
   if (historyResult.ok && Array.isArray(historyResult.trades)) {
     const target = normalizeCooldownKey(request.symbol);
+    const cooldownCommentPrefixes = collectCooldownCommentPrefixes(request.comment);
     // Prefer MT4-exported account timestamp so cooldown math uses the same clock
     // as history closeTime/openTime values written by the EA.
     const accountNowSec = Number(accountResult?.account?.timestamp || 0);
@@ -779,7 +848,12 @@ const evaluatePlaceRiskPolicy = async (request) => {
       ? Math.floor(accountNowSec)
       : Math.floor(Date.now() / 1000);
     const recentTrade = historyResult.trades
-      .filter((t) => normalizeCooldownKey(t.symbol).startsWith(target))
+      .filter((t) => {
+        if (!normalizeCooldownKey(t.symbol).startsWith(target)) return false;
+        if (!cooldownCommentPrefixes.length) return true;
+        const comment = String(t.comment || "");
+        return cooldownCommentPrefixes.some((prefix) => comment.startsWith(prefix));
+      })
       .map((t) => ({
         ticket: Number(t.ticket || 0),
         closeTime: Number(t.closeTime || 0),
@@ -806,7 +880,11 @@ const evaluatePlaceRiskPolicy = async (request) => {
       addCheck(
         "symbol_cooldown",
         !recentClose || cooldownLeft <= 0,
-        recentClose ? formatCooldownDetail(cooldownLeft) : "no recent close"
+        recentClose
+          ? formatCooldownDetail(cooldownLeft)
+          : cooldownCommentPrefixes.length
+          ? "no recent bot-tagged close"
+          : "no recent close"
       );
     } else {
       addCheck("symbol_cooldown", true, "inactive");
@@ -874,6 +952,10 @@ const evaluatePlaceRiskPolicy = async (request) => {
 };
 
 const listOpenPositions = async () => {
+  if (MT5_NATIVE_MODE) {
+    return runMt5Adapter({ action: "positions" });
+  }
+
   try {
     const file = positionsPath();
     if (!fs.existsSync(file)) return { ok: true, positions: [] };
@@ -901,6 +983,10 @@ const listOpenPositions = async () => {
 };
 
 const readMt4AccountSnapshot = async () => {
+  if (MT5_NATIVE_MODE) {
+    return runMt5Adapter({ action: "account" });
+  }
+
   try {
     const file = accountPath();
     if (!fs.existsSync(file)) {
@@ -935,6 +1021,10 @@ const readMt4AccountSnapshot = async () => {
 };
 
 const readMt4History = async () => {
+  if (MT5_NATIVE_MODE) {
+    return runMt5Adapter({ action: "history", days: 90, limit: 500 });
+  }
+
   try {
     const file = historyPath();
     if (!fs.existsSync(file)) {
@@ -968,6 +1058,10 @@ const readMt4History = async () => {
 };
 
 const readMt4Ticks = async ({ symbol } = {}) => {
+  if (MT5_NATIVE_MODE) {
+    return runMt5Adapter({ action: "ticks", symbol: symbol || "", count: 100 });
+  }
+
   try {
     const file = ticksPath();
     if (!fs.existsSync(file)) {
@@ -989,7 +1083,12 @@ const readMt4Ticks = async ({ symbol } = {}) => {
     const valid = ticks.filter((tick) => tick.symbol && Number.isFinite(tick.bid) && Number.isFinite(tick.ask) && tick.time > 0);
     if (!symbol) return { ok: true, ticks: valid };
 
-    const candidates = mt4SymbolCandidates(symbol).map((candidate) => normalizeSymbolToken(candidate));
+    const resolvedExecutable = await resolveExecutableSymbol(symbol);
+    const preferredSymbol = resolvedExecutable.ok && resolvedExecutable.symbol ? resolvedExecutable.symbol : symbol;
+    const candidates = Array.from(new Set([
+      String(preferredSymbol || "").trim(),
+      ...mt4SymbolCandidates(symbol),
+    ].filter(Boolean))).map((candidate) => normalizeSymbolToken(candidate));
     const selected = valid.filter((tick) => {
       const raw = normalizeSymbolToken(tick.symbol);
       return candidates.some((candidate) => raw.startsWith(candidate) || candidate.startsWith(raw));
@@ -1006,7 +1105,33 @@ const readMt4Ticks = async ({ symbol } = {}) => {
   }
 };
 
+const readMt4Market = async ({ symbol, timeframe = "D1", count = 300 } = {}) => {
+  if (MT5_NATIVE_MODE) {
+    return runMt5Adapter({ action: "market", symbol: symbol || "", timeframe, count });
+  }
+
+  const [candlesResult, ticksResult] = await Promise.all([
+    readMt4Candles({ symbol, timeframe, count }),
+    readMt4Ticks({ symbol }),
+  ]);
+  const tick = ticksResult?.tick || (Array.isArray(ticksResult?.ticks) ? ticksResult.ticks[0] : null);
+  if (!candlesResult?.ok) return candlesResult;
+  return {
+    ok: true,
+    source: candlesResult.source || "MT4",
+    symbol: candlesResult.symbol || symbol,
+    requested_symbol: symbol,
+    timeframe,
+    candles: candlesResult.candles || [],
+    tick,
+  };
+};
+
 const readMt4PolicyEvents = async ({ limit = 100 } = {}) => {
+  if (MT5_NATIVE_MODE) {
+    return { ok: true, events: [], limit };
+  }
+
   try {
     const file = policyPath();
     if (!fs.existsSync(file)) {
@@ -1037,6 +1162,10 @@ const readMt4PolicyEvents = async ({ limit = 100 } = {}) => {
 };
 
 const readMt4SymbolSpecs = async ({ symbol } = {}) => {
+  if (MT5_NATIVE_MODE) {
+    return runMt5Adapter({ action: "symbols", symbol: symbol || "" });
+  }
+
   try {
     const file = symbolsPath();
     if (!fs.existsSync(file)) {
@@ -1939,12 +2068,20 @@ const server = http.createServer(async (req, res) => {
 
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
+    if (url.pathname === "/api/mt5" || url.pathname.startsWith("/api/mt5/")) {
+      url.pathname = `/api/mt4${url.pathname.slice("/api/mt5".length)}`;
+    }
+
   if (url.pathname === "/health" || url.pathname === "/api/mt4/health" || url.pathname === "/api/mt4/health/") {
     const headlessStatus = headlessTrader.getStatus();
+    const mt5Health = MT5_NATIVE_MODE ? await runMt5Adapter({ action: "health" }) : null;
     sendJson(res, 200, {
       ok: true,
       service: "market-bridge",
       bridge_version: BRIDGE_VERSION,
+      mode: MT5_NATIVE_MODE ? "native-mt5" : "mt4-csv",
+      trading_enabled: MT5_TRADING_ENABLED,
+      mt5: mt5Health,
       capabilities: BRIDGE_CAPABILITIES,
       mt4_files_dir: MT4_FILES_DIR,
       mt4_files_dir_exists: fs.existsSync(MT4_FILES_DIR),
@@ -1972,6 +2109,21 @@ const server = http.createServer(async (req, res) => {
     }
 
     const result = await readMt4Candles({ symbol, timeframe, count: Number.isFinite(count) ? count : 300 });
+    sendJson(res, result.ok ? 200 : 502, result);
+    return;
+  }
+
+  if (url.pathname === "/api/mt4/market" && req.method === "GET") {
+    const symbol = (url.searchParams.get("symbol") || "").trim();
+    const timeframe = (url.searchParams.get("timeframe") || "D1").trim().toUpperCase();
+    const count = Number(url.searchParams.get("count") || "300");
+
+    if (!symbol) {
+      sendJson(res, 400, { ok: false, error: "symbol is required" });
+      return;
+    }
+
+    const result = await readMt4Market({ symbol, timeframe, count: Number.isFinite(count) ? count : 300 });
     sendJson(res, result.ok ? 200 : 502, result);
     return;
   }

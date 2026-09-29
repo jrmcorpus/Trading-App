@@ -227,6 +227,18 @@ const formatDisplayPair = (symbol: string): string => {
 
 const normalizeMt4Token = (value: string): string => String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 
+const stripLegacyBrokerSuffix = (value: string): string =>
+  String(value || "")
+    .trim()
+    .replace(/micro(?=#|$)/gi, "")
+    .replace(/m(?=#|$)/gi, "");
+
+const normalizeBrokerSuffix = (value: string): string => {
+  const suffix = String(value || "").trim();
+  if (/^(?:micro|m)#?$/i.test(suffix)) return suffix.endsWith("#") ? "#" : "";
+  return suffix;
+};
+
 const parseEnvBoolean = (value: string | undefined, fallback: boolean): boolean => {
   if (value === undefined) return fallback;
   const normalized = String(value).trim().toLowerCase();
@@ -524,7 +536,7 @@ const fetchMt4BridgeCandles = async (
   timeframe: ChartTimeframe,
   config: TimeframeConfig,
   isCryptoSymbol: boolean
-): Promise<{ candles: PriceCandle[]; brokerSymbol: string | null; error: string | null }> => {
+): Promise<{ candles: PriceCandle[]; brokerSymbol: string | null; tick: Mt4Tick | null; error: string | null }> => {
   const baseUrl = import.meta.env.VITE_MT4_BRIDGE_URL || "/api/mt4";
   const mt4SymbolMapRaw = (import.meta.env.VITE_MT4_SYMBOL_MAP as string | undefined) || "";
   let mt4SymbolMap: Record<string, string> = {};
@@ -536,11 +548,9 @@ const fetchMt4BridgeCandles = async (
       mt4SymbolMap = {};
     }
   }
-  const preferredSuffix = (import.meta.env.VITE_MT4_SYMBOL_SUFFIX as string | undefined) || "";
-  const preferredCryptoSuffix =
-    (import.meta.env.VITE_MT4_CRYPTO_SUFFIX as string | undefined) ||
-    (preferredSuffix === "m#" ? "#" : preferredSuffix) ||
-    "#";
+  const preferredSuffix = normalizeBrokerSuffix((import.meta.env.VITE_MT4_SYMBOL_SUFFIX as string | undefined) || "");
+  const configuredCryptoSuffix = (import.meta.env.VITE_MT4_CRYPTO_SUFFIX as string | undefined) || "";
+  const preferredCryptoSuffix = normalizeBrokerSuffix(configuredCryptoSuffix || preferredSuffix) || "#";
   const normalized = normalizeMt4Token(symbol);
   const isMetal = normalized === "GOLD" || normalized === "XAUUSD" || normalized === "SILVER" || normalized === "XAGUSD";
   const baseTokens =
@@ -552,7 +562,7 @@ const fetchMt4BridgeCandles = async (
   const isCryptoPair = isCryptoSymbol;
   const suffixPriority = isCryptoPair
     ? [preferredCryptoSuffix, "#", ""]
-    : [preferredSuffix, "m#", "#", "", "m", ".", "pro"];
+    : [preferredSuffix, "#", "", "m#", "m", ".", "pro"];
   const querySymbols: string[] = [];
   const pushUnique = (value: string) => {
     const v = String(value || "").trim();
@@ -560,7 +570,7 @@ const fetchMt4BridgeCandles = async (
     if (!querySymbols.includes(v)) querySymbols.push(v);
   };
   const mapped = mt4SymbolMap[normalized];
-  if (mapped) pushUnique(mapped);
+  if (mapped) pushUnique(stripLegacyBrokerSuffix(mapped));
   for (const baseToken of baseTokens) {
     for (const suffix of suffixPriority) {
       pushUnique(`${baseToken}${suffix}`);
@@ -577,10 +587,10 @@ const fetchMt4BridgeCandles = async (
   pushUnique(symbol);
 
   try {
-    let lastError = "MT4 bridge request failed";
+    let lastError = "MT5 bridge request failed";
 
     for (const querySymbol of querySymbols) {
-      const url = `${baseUrl}/candles?symbol=${encodeURIComponent(querySymbol)}&timeframe=${timeframe}&count=${config.candles}`;
+      const url = `${baseUrl}/market?symbol=${encodeURIComponent(querySymbol)}&timeframe=${timeframe}&count=${config.candles}`;
       const response = await fetch(url, { method: "GET" });
       if (!response.ok) {
         try {
@@ -596,7 +606,7 @@ const fetchMt4BridgeCandles = async (
 
       const data = await response.json();
       if (!data?.ok || !Array.isArray(data?.candles)) {
-        lastError = typeof data?.error === "string" ? data.error : "MT4 bridge returned no candles";
+          lastError = typeof data?.error === "string" ? data.error : "MT5 bridge returned no candles";
         continue;
       }
 
@@ -621,19 +631,31 @@ const fetchMt4BridgeCandles = async (
         .slice(-config.candles);
 
       if (!candles.length) {
-        lastError = "MT4 bridge returned no candles";
+        lastError = "MT5 bridge returned no candles";
         continue;
       }
 
       return {
         candles,
         brokerSymbol: typeof data.symbol === "string" ? data.symbol : querySymbol,
+        tick:
+          data?.tick &&
+          Number.isFinite(Number(data.tick.bid)) &&
+          Number.isFinite(Number(data.tick.ask)) &&
+          Number.isFinite(Number(data.tick.time))
+            ? {
+                symbol: String(data.tick.symbol || data.symbol || querySymbol),
+                bid: Number(data.tick.bid),
+                ask: Number(data.tick.ask),
+                time: Number(data.tick.time),
+              }
+            : null,
         error: null,
       };
     }
-    return { candles: [], brokerSymbol: null, error: lastError };
+    return { candles: [], brokerSymbol: null, tick: null, error: lastError };
   } catch {
-    return { candles: [], brokerSymbol: null, error: "MT4 bridge unavailable" };
+    return { candles: [], brokerSymbol: null, tick: null, error: "MT5 bridge unavailable" };
   }
 };
 
@@ -736,12 +758,12 @@ const describeMt4Insufficiency = (
   explicitError: string | null
 ): string => {
   if (explicitError && explicitError.trim()) return explicitError;
-  if (!candles.length) return `MT4 returned no candles for ${symbol} ${timeframe}`;
+  if (!candles.length) return `MT5 returned no candles for ${symbol} ${timeframe}`;
 
   const count = candles.length;
   const last = candles[candles.length - 1];
   const iso = new Date(Number(last.time) * 1000).toISOString().replace("T", " ").replace(".000Z", " UTC");
-  return `MT4 returned ${count} candle${count === 1 ? "" : "s"} for ${symbol} ${timeframe} (last candle ${iso})`;
+  return `MT5 returned ${count} candle${count === 1 ? "" : "s"} for ${symbol} ${timeframe} (last candle ${iso})`;
 };
 
 // Retained for optional future non-MT4 mode; referenced to satisfy strict noUnusedLocals.
@@ -774,29 +796,6 @@ const getRefreshIntervalMs = (timeframe: ChartTimeframe): number => {
       return 6000;
     default:
       return 2000;
-  }
-};
-
-const fetchMt4BridgeTick = async (symbol: string): Promise<Mt4Tick | null> => {
-  const baseUrl = import.meta.env.VITE_MT4_BRIDGE_URL || "/api/mt4";
-  try {
-    const response = await fetch(`${baseUrl}/ticks?symbol=${encodeURIComponent(symbol)}`, { method: "GET" });
-    if (!response.ok) return null;
-    const data = await response.json();
-    if (!data?.ok || !data?.tick) return null;
-    const tick = data.tick;
-    const bid = Number(tick.bid);
-    const ask = Number(tick.ask);
-    const time = Number(tick.time);
-    if (!Number.isFinite(bid) || !Number.isFinite(ask) || !Number.isFinite(time) || time <= 0) return null;
-    return {
-      symbol: String(tick.symbol || symbol),
-      bid,
-      ask,
-      time,
-    };
-  } catch {
-    return null;
   }
 };
 
@@ -1156,7 +1155,7 @@ export const PriceChart: React.FC<PriceChartProps> = ({
         const ageMs = nowMs - lastMs;
         if (ageMs > staleThresholdMs) {
           const iso = new Date(lastMs).toISOString().replace("T", " ").replace(".000Z", " UTC");
-          setStaleFeedWarning(`Stale MT4 feed (last candle time ${iso})`);
+          setStaleFeedWarning(`Stale MT5 feed (last candle time ${iso})`);
         } else {
           setStaleFeedWarning(null);
         }
@@ -1179,7 +1178,7 @@ export const PriceChart: React.FC<PriceChartProps> = ({
         let activeSource: ChartDataSource = "MT4";
         const mt4Result = await fetchMt4BridgeCandles(symbol, timeframe, config, isCrypto);
         candles = trimToRecentContinuousCandles(mt4Result.candles, timeframe);
-        const liveTick = await fetchMt4BridgeTick(symbol);
+        const liveTick = mt4Result.tick;
         setBridgeRttMs(Math.max(0, Math.round(performance.now() - requestStartedAt)));
         candles = applyTickToCandles(candles, liveTick, timeframe);
         const mt4Usable = candles.length >= 2 || (MT4_ONLY_MODE && candles.length >= 1);
@@ -1240,7 +1239,7 @@ export const PriceChart: React.FC<PriceChartProps> = ({
           const ageMs = computedFeedAgeMs;
           if (ageMs > staleThresholdMs) {
             const iso = new Date(lastMs).toISOString().replace("T", " ").replace(".000Z", " UTC");
-            setStaleFeedWarning(`Stale MT4 feed (last candle time ${iso})`);
+            setStaleFeedWarning(`Stale MT5 feed (last candle time ${iso})`);
           } else {
             setStaleFeedWarning(null);
           }
@@ -1271,8 +1270,8 @@ export const PriceChart: React.FC<PriceChartProps> = ({
         console.error("Error loading chart data:", error);
         setSource("MT4");
         setResolvedBrokerSymbol(null);
-        setMt4Status("MT4 bridge unavailable");
-        setNoDataReason("MT4 bridge unavailable");
+        setMt4Status("MT5 bridge unavailable");
+        setNoDataReason("MT5 bridge unavailable");
         setStaleFeedWarning(null);
         setBridgeRttMs(null);
         setFeedAgeMs(null);
@@ -1304,7 +1303,7 @@ export const PriceChart: React.FC<PriceChartProps> = ({
       ? ((stats.candle.close - stats.previousClose) / stats.previousClose) * 100
       : 0;
   const sourceMeta: Record<ChartDataSource, { label: string; className: string }> = {
-    MT4: { label: "MT4", className: "text-lime-300" },
+    MT4: { label: "MT5", className: "text-lime-300" },
     TWELVE_DATA: { label: "Twelve Data", className: "text-sky-300" },
     ALPHA_VANTAGE: { label: "Alpha Vantage", className: "text-cyan-300" },
     YAHOO_FINANCE: { label: "Yahoo Finance", className: "text-violet-300" },
@@ -1376,7 +1375,7 @@ export const PriceChart: React.FC<PriceChartProps> = ({
               className="text-amber-300 cursor-help"
               title={mt4Status ?? undefined}
             >
-              MT4 fallback active for {formatDisplayPair(symbol)} {timeframe}
+              MT5 fallback active for {formatDisplayPair(symbol)} {timeframe}
             </span>
           )}
           {staleFeedWarning && (

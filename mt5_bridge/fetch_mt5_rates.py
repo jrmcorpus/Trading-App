@@ -89,6 +89,7 @@ def main() -> None:
 
         candles: List[Dict] = []
         for row in rates:
+            tick_volume = row["tick_volume"] if "tick_volume" in row.dtype.names else 0
             candles.append(
                 {
                     "time": int(row["time"]),
@@ -96,7 +97,7 @@ def main() -> None:
                     "high": float(row["high"]),
                     "low": float(row["low"]),
                     "close": float(row["close"]),
-                    "volume": float(row.get("tick_volume", 0) or 0),
+                    "volume": float(tick_volume or 0),
                 }
             )
 
@@ -116,4 +117,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

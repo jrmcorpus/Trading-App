@@ -1,0 +1,4 @@
+interface:
+  display_name: "Headless Trader Tuner"
+  short_description: "Tune managed symbol trading behavior"
+  default_prompt: "Use $headless-trader-tuner to adjust GOLD and ETHUSD auto-trading behavior, execution style, and protection logic."

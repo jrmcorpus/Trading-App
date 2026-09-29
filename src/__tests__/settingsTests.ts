@@ -12,7 +12,6 @@ import {
   watchSetting,
   verifySetting,
   exportSettingsBundle,
-  clearAllSettings,
 } from "../utils/debugSettings";
 
 interface TestResult {

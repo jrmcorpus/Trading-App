@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trading App Runtime Ops"
+  short_description: "Operate and verify the local app runtime"
+  default_prompt: "Use $trading-app-runtime-ops to restart the local trading app stack and verify the live frontend, bridge, and headless runtime."

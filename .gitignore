@@ -31,6 +31,7 @@ mt5_bridge/headless-config.json
 
 # Coverage
 coverage/
+__pycache__/
 
 # Misc
 .cache/

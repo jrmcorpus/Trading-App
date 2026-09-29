@@ -3,7 +3,7 @@
 // Bridge Settings (data export + web app execution only)
 // Note: This EA does NOT run any trading strategy by itself.
 // All trade decisions come from the web app via bridge_command.csv.
-
+//GOLDm#,SILVERm#,ETHUSD#,EURUSDm#
 input int MagicNumber = 44001;
 input string OrderCommentPrefix = "mt4-pro-ea";
 
@@ -570,13 +570,18 @@ void ExportAll()
 
    if(ExportMarketWatchSymbols)
    {
+      int exported = 0;
       int total = SymbolsTotal(true);
       for(int i = 0; i < total; i++)
       {
          string sym2 = SymbolName(i, true);
-         if(StringLen(sym2) > 0) ExportForSymbol(sym2);
+         if(StringLen(sym2) > 0)
+         {
+            ExportForSymbol(sym2);
+            exported++;
+         }
       }
-      return;
+      if(exported > 0) return;
    }
 
    ExportForSymbol(Symbol());
@@ -609,6 +614,7 @@ void ExportTicks()
 
    if(ExportMarketWatchSymbols)
    {
+      int exported = 0;
       int total = SymbolsTotal(true);
       for(int j = 0; j < total; j++)
       {
@@ -618,10 +624,17 @@ void ExportTicks()
          RefreshRates();
          double bid2 = MarketInfo(sym2, MODE_BID);
          double ask2 = MarketInfo(sym2, MODE_ASK);
-         if(bid2 > 0 && ask2 > 0) FileWrite(handle, sym2, DoubleToString(bid2, 8), DoubleToString(ask2, 8), (int)nowTs);
+         if(bid2 > 0 && ask2 > 0)
+         {
+            FileWrite(handle, sym2, DoubleToString(bid2, 8), DoubleToString(ask2, 8), (int)nowTs);
+            exported++;
+         }
       }
-      FileClose(handle);
-      return;
+      if(exported > 0)
+      {
+         FileClose(handle);
+         return;
+      }
    }
 
    string sym3 = Symbol();
@@ -662,6 +675,7 @@ void ExportSymbolSpecs()
 
    if(ExportMarketWatchSymbols)
    {
+      int exported = 0;
       int total = SymbolsTotal(true);
       for(int j = 0; j < total; j++)
       {
@@ -674,9 +688,13 @@ void ExportSymbolSpecs()
          double tickValue2 = MarketInfo(sym2, MODE_TICKVALUE);
          double tickSize2 = MarketInfo(sym2, MODE_TICKSIZE);
          FileWrite(handle, sym2, DoubleToString(lotSize2, 0), digits2, DoubleToString(point2, 8), DoubleToString(tickValue2, 8), DoubleToString(tickSize2, 8));
+         exported++;
       }
-      FileClose(handle);
-      return;
+      if(exported > 0)
+      {
+         FileClose(handle);
+         return;
+      }
    }
 
    string sym3 = Symbol();

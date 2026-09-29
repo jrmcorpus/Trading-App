@@ -10,6 +10,11 @@ const METAL_OIL_SYMBOL_PATTERN = /^(XAUUSD|XAGUSD|USOIL|WTIUSD|XTIUSD|GOLD|SILVE
 export const normalizeTradeSymbol = (raw: string): string => {
   const cleaned = String(raw || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   if (cleaned.includes("US30")) return "US30CASH";
+  if (cleaned.startsWith("GOLD") || cleaned.startsWith("XAU")) return "GOLD";
+  if (cleaned.startsWith("SILVER") || cleaned.startsWith("XAG")) return "SILVER";
+  if (cleaned.startsWith("USOIL") || cleaned.startsWith("WTIUSD") || cleaned.startsWith("XTIUSD")) {
+    return "USOIL";
+  }
   if (cleaned.length >= 6 && /^[A-Z]{6}/.test(cleaned)) return cleaned.slice(0, 6);
   return cleaned || String(raw || "").toUpperCase();
 };

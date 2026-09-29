@@ -1,0 +1,4 @@
+interface:
+  display_name: "MT4 Bridge Diagnostics"
+  short_description: "Diagnose MT4 bridge data and API issues"
+  default_prompt: "Use $mt4-bridge-diagnostics to inspect MT4 export files, bridge endpoints, and broker symbol resolution problems."

@@ -6,28 +6,33 @@ const TIMEFRAMES = ["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN"];
 const CRYPTO_ASSETS = ["BTCUSD", "ETHUSD", "XRPUSD", "LTCUSD", "BNBUSD", "ADAUSD", "DOGEUSD", "SOLUSD"];
 const DEFAULT_WATCHLIST = [
   { symbol: "GOLD", timeframe: "M5" },
+  { symbol: "ETHUSD", timeframe: "M15" },
 ];
 const DEFAULT_AUTO_CONFIG = {
   enabled: true,
   sideFilter: "BOTH",
-  minConfidence: 70,
-  minWinRate: 65,
+  minConfidence: 30,
+  minWinRate: 0,
   minRR: 1.0,
   maxSpreadPoints: 80,
-  cooldownMin: 15,
-  maxOpenTrades: 1,
+  cooldownMin: 60,
+  maxOpenTrades: 2,
   requireStrong: true,
+  enforceTrendStack: false,
   enforceSymbolCooldown: true,
-  enforceDailyLossLimit: false,
-  enforceHardRiskBlock: false,
+  enforceDailyLossLimit: true,
+  enforceHardRiskBlock: true,
+  strategyMode: "SCALP_M15",
+  scalpAggressive: true,
+  sessionGateEnabled: true,
   biasTimeframe: "H4",
   setupTimeframe: "H1",
   entryTimeframe: "M5",
-  reentryMode: "BALANCED",
+  reentryMode: "OFF",
   timeframeOverride: "PANEL",
   entryMode: "MARKET",
-  allowMarketFallback: false,
-  fallbackMinConfidence: 70,
+  allowMarketFallback: true,
+  fallbackMinConfidence: 30,
   fallbackRrBuffer: 0.2,
   botLots: 0.1,
   riskMode: "USD",
@@ -39,10 +44,10 @@ const DEFAULT_AUTO_CONFIG = {
   atrBufferMult: 0.25,
   minLot: 0.1,
   lotStep: 0.01,
-  adaptiveLearningEnabled: true,
+  adaptiveLearningEnabled: false,
   learnedBlockedSymbols: [],
   learnedBlockedSessions: [],
-  commentTag: "gold-overnight-scalp",
+  commentTag: "managed-dual-core",
   ma200FlatFilterEnabled: true,
   ma200FlatMaxAtrRatio: 0.09,
   highImpactNewsFilterEnabled: true,
@@ -60,17 +65,73 @@ const DEFAULT_PROTECT_CONFIG = {
   breakEvenEnabled: true,
   breakEvenR: 1.0,
   breakEvenProfitUsd: 0.3,
-  degradeCloseEnabled: true,
+  degradeCloseEnabled: false,
   degradeMinConfidence: 82,
   biasFlipProfitLockEnabled: true,
   biasFlipTpProgressPct: 35,
   overnightProfitRetraceLockEnabled: true,
   overnightProfitRetraceArmUsd: 0.8,
   overnightProfitRetraceCloseUsd: 0.4,
-  overnightEnabled: true,
-  overnightProfitUsd: 1.5,
-  overnightLossUsd: 1.5,
+  overnightEnabled: false,
+  overnightProfitUsd: 1.1,
+  overnightLossUsd: 1.2,
 };
+const DEFAULT_SYMBOL_PROFILES = [
+  {
+    symbol: "GOLD",
+    auto: {
+      enabled: true,
+      sideFilter: "BOTH",
+      minConfidence: 30,
+      minWinRate: 0,
+      minRR: 1.0,
+      cooldownMin: 60,
+      maxOpenTrades: 2,
+      requireStrong: false,
+      enforceTrendStack: false,
+      strategyMode: "SCALP_M15",
+      scalpAggressive: true,
+      sessionGateEnabled: true,
+      entryTimeframe: "M5",
+      entryMode: "MARKET",
+      commentTag: "gold-overnight-scalp",
+    },
+    protect: {
+      enabled: true,
+      overnightEnabled: false,
+      degradeCloseEnabled: false,
+      overnightProfitUsd: 1.1,
+      overnightLossUsd: 1.2,
+    },
+  },
+  {
+    symbol: "ETHUSD",
+    auto: {
+      enabled: true,
+      sideFilter: "BOTH",
+      minConfidence: 30,
+      minWinRate: 0,
+      minRR: 1.0,
+      cooldownMin: 45,
+      maxOpenTrades: 2,
+      requireStrong: false,
+      enforceTrendStack: false,
+      strategyMode: "SCALP_M15",
+      scalpAggressive: true,
+      sessionGateEnabled: true,
+      entryTimeframe: "M15",
+      entryMode: "MARKET",
+      commentTag: "eth-trend-pullback",
+    },
+    protect: {
+      enabled: true,
+      degradeCloseEnabled: false,
+      overnightEnabled: false,
+    },
+  },
+];
+const MANAGED_PROTECT_MAX_RISK_USD = 2;
+const AGGRESSIVE_AUTO_TP_TARGET_USD = 1;
 const ADAPTIVE_SESSIONS = ["ASIA", "LONDON", "OVERLAP", "NEW_YORK", "QUIET"];
 const MAX_RUNTIME_LOGS = 200;
 const MAX_AUDIT_LOGS = 500;
@@ -78,6 +139,16 @@ const OVERNIGHT_MAX_CONSECUTIVE_LOSSES = 3;
 const HIGH_IMPACT_NEWS_CACHE_MS = 5 * 60 * 1000;
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+
+const computeMoneyPerPricePerLot = (tickValue, tickSize, point, lotSize) => {
+  if (Number.isFinite(tickValue) && tickValue > 0 && Number.isFinite(tickSize) && tickSize > 0) {
+    return tickValue / tickSize;
+  }
+  if (Number.isFinite(tickValue) && tickValue > 0 && Number.isFinite(point) && point > 0) {
+    return tickValue / point;
+  }
+  return Number.isFinite(lotSize) && lotSize > 0 ? lotSize : 0;
+};
 
 const parseNumber = (value, fallback, min, max) => {
   const numeric = Number(value);
@@ -164,6 +235,13 @@ const AUTO_SETUP_TIMEFRAME = "H1";
 const getTrendFilterFrames = (entryTimeframe) => [String(entryTimeframe || "").toUpperCase() === "M5" ? "M5" : "M15", AUTO_SETUP_TIMEFRAME, AUTO_BIAS_TIMEFRAME];
 
 const normalizeSymbol = (value) => String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+const toSymbolKey = (value) => normalizeSymbol(value).replace(/M$/, "");
+const symbolsMatch = (left, right) => {
+  const leftKey = toSymbolKey(left);
+  const rightKey = toSymbolKey(right);
+  if (!leftKey || !rightKey) return false;
+  return leftKey === rightKey || leftKey.startsWith(rightKey) || rightKey.startsWith(leftKey);
+};
 const isCryptoSymbol = (value) => CRYPTO_ASSETS.some((asset) => normalizeSymbol(asset) === normalizeSymbol(value));
 const toChartTimeframe = (value, fallback = "D1") => {
   const normalized = String(value || "").toUpperCase();
@@ -199,9 +277,13 @@ const sanitizeAutoConfig = (value = {}, fallback = DEFAULT_AUTO_CONFIG) => ({
   cooldownMin: parseInteger(value.cooldownMin, fallback.cooldownMin, 1, 1440),
   maxOpenTrades: parseInteger(value.maxOpenTrades, fallback.maxOpenTrades, 1, 50),
   requireStrong: parseBoolean(value.requireStrong, fallback.requireStrong),
+  enforceTrendStack: parseBoolean(value.enforceTrendStack, fallback.enforceTrendStack),
   enforceSymbolCooldown: parseBoolean(value.enforceSymbolCooldown, fallback.enforceSymbolCooldown),
   enforceDailyLossLimit: parseBoolean(value.enforceDailyLossLimit, fallback.enforceDailyLossLimit),
   enforceHardRiskBlock: parseBoolean(value.enforceHardRiskBlock, fallback.enforceHardRiskBlock),
+  strategyMode: String(value.strategyMode || fallback.strategyMode).toUpperCase() === "SCALP_M15" ? "SCALP_M15" : "CLASSIC_STACK",
+  scalpAggressive: parseBoolean(value.scalpAggressive, fallback.scalpAggressive),
+  sessionGateEnabled: parseBoolean(value.sessionGateEnabled, fallback.sessionGateEnabled),
   biasTimeframe: AUTO_BIAS_TIMEFRAME,
   setupTimeframe: AUTO_SETUP_TIMEFRAME,
   entryTimeframe:
@@ -302,12 +384,41 @@ const sanitizeProtectConfig = (value = {}, fallback = DEFAULT_PROTECT_CONFIG) =>
   overnightLossUsd: parseNumber(value.overnightLossUsd, fallback.overnightLossUsd, 0.01, 1000000),
 });
 
+const sanitizeSymbolProfiles = (value, defaults) => {
+  if (!Array.isArray(value)) {
+    return Array.isArray(defaults)
+      ? defaults.map((item) => ({
+          symbol: sanitizeSymbol(item?.symbol),
+          ...(item?.auto ? { auto: sanitizeAutoConfig(item.auto, DEFAULT_AUTO_CONFIG) } : {}),
+          ...(item?.protect ? { protect: sanitizeProtectConfig(item.protect, DEFAULT_PROTECT_CONFIG) } : {}),
+        }))
+      : [];
+  }
+
+  const seen = new Set();
+  return value
+    .map((item) => {
+      const symbol = sanitizeSymbol(item?.symbol);
+      const key = toSymbolKey(symbol);
+      if (!symbol || !key || seen.has(key)) return null;
+      seen.add(key);
+      return {
+        symbol,
+        ...(item?.auto ? { auto: sanitizeAutoConfig(item.auto, DEFAULT_AUTO_CONFIG) } : {}),
+        ...(item?.protect ? { protect: sanitizeProtectConfig(item.protect, DEFAULT_PROTECT_CONFIG) } : {}),
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 12);
+};
+
 const sanitizeConfig = (value = {}, defaults) => ({
   version: 1,
   mode: "HEADLESS",
   watchlist: sanitizeWatchlist(value.watchlist, defaults.watchlist),
   auto: sanitizeAutoConfig(value.auto, defaults.auto),
   protect: sanitizeProtectConfig(value.protect, defaults.protect),
+  symbolProfiles: sanitizeSymbolProfiles(value.symbolProfiles, defaults.symbolProfiles),
 });
 
 const average = (values) => {
@@ -544,6 +655,7 @@ export const createHeadlessTrader = async (options) => {
       ),
     },
     protect: DEFAULT_PROTECT_CONFIG,
+    symbolProfiles: DEFAULT_SYMBOL_PROFILES,
   };
 
   const state = {
@@ -591,7 +703,57 @@ export const createHeadlessTrader = async (options) => {
     await fsPromises.writeFile(configPath, JSON.stringify(state.config, null, 2), "utf8");
   };
 
-  const buildManagedTradeCommentPrefix = () => String(state.config.auto.commentTag || "").trim();
+  const getSymbolProfile = (symbol, config = state.config) =>
+    (Array.isArray(config?.symbolProfiles) ? config.symbolProfiles : []).find((profile) => symbolsMatch(profile?.symbol, symbol)) || null;
+
+  const getEffectiveAutoConfig = (symbol, config = state.config) => {
+    const profile = getSymbolProfile(symbol, config);
+    if (!profile?.auto) {
+      return config.auto;
+    }
+    const effective = sanitizeAutoConfig({ ...config.auto, ...profile.auto }, config.auto);
+    if (!config.auto.enabled) {
+      return { ...effective, enabled: false };
+    }
+    return effective;
+  };
+
+  const getEffectiveProtectConfig = (symbol, config = state.config) => {
+    const profile = getSymbolProfile(symbol, config);
+    if (!profile?.protect) {
+      return config.protect;
+    }
+    const effective = sanitizeProtectConfig({ ...config.protect, ...profile.protect }, config.protect);
+    return {
+      ...effective,
+      enabled: config.protect.enabled ? effective.enabled : false,
+      overnightEnabled: config.protect.overnightEnabled ? effective.overnightEnabled : false,
+    };
+  };
+
+  const hasAnyAutoEnabled = (config = state.config) =>
+    Boolean(config.auto.enabled && config.watchlist.some((item) => getEffectiveAutoConfig(item.symbol, config).enabled));
+
+  const hasAnyProtectEnabled = (config = state.config) =>
+    config.watchlist.some((item) => {
+      const protectConfig = getEffectiveProtectConfig(item.symbol, config);
+      return protectConfig.enabled || protectConfig.overnightEnabled;
+    });
+
+  const collectManagedTradeCommentPrefixes = ({ overnightOnly = false, config = state.config } = {}) => {
+    const prefixes = new Set();
+    for (const item of Array.isArray(config.watchlist) ? config.watchlist : []) {
+      const autoConfig = getEffectiveAutoConfig(item.symbol, config);
+      const protectConfig = getEffectiveProtectConfig(item.symbol, config);
+      if (!autoConfig.enabled && !(overnightOnly && protectConfig.overnightEnabled)) continue;
+      if (overnightOnly && !protectConfig.overnightEnabled) continue;
+      const prefix = String(autoConfig.commentTag || "").trim();
+      if (prefix) {
+        prefixes.add(prefix);
+      }
+    }
+    return Array.from(prefixes);
+  };
 
   const buildManagedTradeKey = (trade) =>
     [Number(trade?.ticket || 0), Number(trade?.closeTime || 0), Number(trade?.profit || 0)].join("|");
@@ -615,10 +777,12 @@ export const createHeadlessTrader = async (options) => {
       try {
         const historyResult = await readMt4History();
         if (historyResult.ok && Array.isArray(historyResult.trades)) {
-          const prefix = buildManagedTradeCommentPrefix();
+          const prefixes = collectManagedTradeCommentPrefixes({ overnightOnly: true });
           state.overnightLossGuard.processedTradeKeys = new Set(
             historyResult.trades
-              .filter((trade) => String(trade?.comment || "").startsWith(prefix))
+              .filter((trade) =>
+                prefixes.some((prefix) => String(trade?.comment || "").startsWith(prefix))
+              )
               .map((trade) => buildManagedTradeKey(trade))
           );
           trimProcessedTradeKeys();
@@ -654,30 +818,63 @@ export const createHeadlessTrader = async (options) => {
     state.overnightLossGuard.active = true;
     state.overnightLossGuard.stopReason = reason;
     state.overnightLossGuard.stoppedAtMs = Date.now();
-    state.config = sanitizeConfig(
-      {
-        ...state.config,
-        auto: { ...state.config.auto, enabled: false },
-        protect: { ...state.config.protect, overnightEnabled: false },
-      },
-      runtimeDefaults
-    );
+    const matchedProfile = getSymbolProfile(symbol);
+    if (matchedProfile) {
+      state.config = sanitizeConfig(
+        {
+          ...state.config,
+          symbolProfiles: state.config.symbolProfiles.map((profile) =>
+            symbolsMatch(profile.symbol, symbol)
+              ? {
+                  ...profile,
+                  auto: { ...(profile.auto || {}), enabled: false },
+                  protect: { ...(profile.protect || {}), overnightEnabled: false },
+                }
+              : profile
+          ),
+        },
+        runtimeDefaults
+      );
+    } else {
+      state.config = sanitizeConfig(
+        {
+          ...state.config,
+          auto: { ...state.config.auto, enabled: false },
+          protect: { ...state.config.protect, overnightEnabled: false },
+        },
+        runtimeDefaults
+      );
+    }
     await persistConfig();
     await refreshTimers();
-    state.autoStatus = `Headless auto-trade blocked: ${reason}`;
-    state.protectStatus = `Overnight mode disabled after ${OVERNIGHT_MAX_CONSECUTIVE_LOSSES} consecutive losses`;
+    state.autoStatus = matchedProfile
+      ? `Headless auto-trade blocked for ${matchedProfile.symbol}: ${reason}`
+      : `Headless auto-trade blocked: ${reason}`;
+    state.protectStatus = matchedProfile
+      ? `Overnight mode disabled for ${matchedProfile.symbol} after ${OVERNIGHT_MAX_CONSECUTIVE_LOSSES} consecutive losses`
+      : `Overnight mode disabled after ${OVERNIGHT_MAX_CONSECUTIVE_LOSSES} consecutive losses`;
     pushLog("WARN", state.autoStatus);
     pushLog("WARN", state.protectStatus);
   };
 
   const syncOvernightLossGuard = async () => {
     if (typeof readMt4History !== "function") return;
+    const prefixes = collectManagedTradeCommentPrefixes({ overnightOnly: true });
+    if (!prefixes.length) {
+      state.overnightLossGuard.processedTradeKeys = new Set();
+      state.overnightLossGuard.consecutiveLosses = 0;
+      state.overnightLossGuard.initialized = true;
+      return;
+    }
     const historyResult = await readMt4History();
     if (!historyResult.ok || !Array.isArray(historyResult.trades)) return;
 
-    const prefix = buildManagedTradeCommentPrefix();
     const managedTrades = historyResult.trades
-      .filter((trade) => Number(trade?.closeTime || 0) > 0 && String(trade?.comment || "").startsWith(prefix))
+      .filter(
+        (trade) =>
+          Number(trade?.closeTime || 0) > 0 &&
+          prefixes.some((prefix) => String(trade?.comment || "").startsWith(prefix))
+      )
       .sort((a, b) => {
         const closeDiff = Number(a.closeTime || 0) - Number(b.closeTime || 0);
         if (closeDiff !== 0) return closeDiff;
@@ -695,7 +892,8 @@ export const createHeadlessTrader = async (options) => {
       state.overnightLossGuard.initialized = true;
       if (
         state.overnightLossGuard.consecutiveLosses >= OVERNIGHT_MAX_CONSECUTIVE_LOSSES &&
-        (state.config.auto.enabled || state.config.protect.overnightEnabled)
+        hasAnyAutoEnabled() &&
+        hasAnyProtectEnabled()
       ) {
         await activateOvernightLossStop(managedTrades[managedTrades.length - 1]);
       }
@@ -722,7 +920,8 @@ export const createHeadlessTrader = async (options) => {
       if (
         !state.overnightLossGuard.active &&
         state.overnightLossGuard.consecutiveLosses >= OVERNIGHT_MAX_CONSECUTIVE_LOSSES &&
-        (state.config.auto.enabled || state.config.protect.overnightEnabled)
+        hasAnyAutoEnabled() &&
+        hasAnyProtectEnabled()
       ) {
         await activateOvernightLossStop(trade);
         return;
@@ -748,22 +947,23 @@ export const createHeadlessTrader = async (options) => {
     }
   };
 
-  const getMinSlPointsForSymbol = (symbol) => {
-    const configured = Math.max(1, Number(state.config.auto.minSlPoints) || DEFAULT_AUTO_CONFIG.minSlPoints);
+  const getMinSlPointsForSymbol = (symbol, autoConfig = state.config.auto) => {
+    const configured = Math.max(1, Number(autoConfig.minSlPoints) || DEFAULT_AUTO_CONFIG.minSlPoints);
     return Math.max(configured, getSymbolExecutionPreset(symbol).minSlPoints);
   };
 
-  const getSpreadGuardPointsForSymbol = (symbol) =>
+  const getSpreadGuardPointsForSymbol = (symbol, autoConfig = state.config.auto) =>
     Math.max(
       1,
-      (Math.max(1, Number(state.config.auto.maxSpreadPoints) || defaultAutoMaxSpreadPoints)) *
+      (Math.max(1, Number(autoConfig.maxSpreadPoints) || defaultAutoMaxSpreadPoints)) *
         getSymbolExecutionPreset(symbol).spreadMult
     );
 
   const getSlippageGuardPointsForSymbol = (symbol) =>
     Math.max(1, autoMaxSlippagePoints * getSymbolExecutionPreset(symbol).slippageMult);
 
-  const isAutoSessionWindowOpen = (symbol, nowMs = Date.now()) => {
+  const isAutoSessionWindowOpen = (symbol, autoConfig = state.config.auto, nowMs = Date.now()) => {
+    if (autoConfig.sessionGateEnabled === false) return true;
     if (!autoSessionWindowEnabled) return true;
     if (isCryptoSymbol(symbol) && !autoSessionWindowIncludeCrypto) return true;
     const localMinute = getMinuteInTimeZone(nowMs, autoSessionWindowTz);
@@ -866,7 +1066,81 @@ export const createHeadlessTrader = async (options) => {
       movingAverage200Prev: previousMovingAverage200,
       movingAverage200Slope: ma200Slope,
       movingAverage200SlopeAtrRatio: ma200SlopeAtrRatio,
+      lastOpen: last.open,
+      lastHigh: last.high,
+      lastLow: last.low,
+      lastClose: last.close,
+      prevOpen: prev.open,
+      prevHigh: prev.high,
+      prevLow: prev.low,
+      prevClose: prev.close,
       lastCandleTime: last.time,
+    };
+  };
+
+  const getDirectionalStructureTarget = (side, data, entryPrice, point) => {
+    const rawTarget =
+      side === "BUY"
+        ? Math.max(Number(data.resistanceLevel), Number(data.swingHigh))
+        : Math.min(Number(data.supportLevel), Number(data.swingLow));
+    if (!Number.isFinite(rawTarget) || rawTarget <= 0) return null;
+    if (side === "BUY" && !(rawTarget > entryPrice + point)) return null;
+    if (side === "SELL" && !(rawTarget < entryPrice - point)) return null;
+    return rawTarget;
+  };
+
+  const evaluateDirectionalConfirmation = (symbol, data, side, autoConfig = state.config.auto) => {
+    const point = getPointSizeForSymbol(symbol, data.current);
+    const atrValue =
+      Number.isFinite(data.atr) && data.atr > 0
+        ? data.atr
+        : Math.max(Math.abs(data.high - data.low) / 14, point * 20);
+    const structureLevel =
+      side === "BUY"
+        ? Math.min(Number(data.supportLevel), Number(data.swingLow))
+        : Math.max(Number(data.resistanceLevel), Number(data.swingHigh));
+    const zoneDistance = Math.abs(Number(data.current) - structureLevel);
+    const zoneBuffer = Math.max(point * Math.max(6, getMinSlPointsForSymbol(symbol, autoConfig) * 0.5), atrValue * 0.35);
+    const maOk = side === "BUY" ? data.current >= data.movingAverage50 : data.current <= data.movingAverage50;
+    const rsi = Number(data.rsi || 0);
+    const rsiOk = side === "BUY" ? rsi >= 35 && rsi <= 60 : rsi >= 40 && rsi <= 65;
+    const candleBody = Math.max(Math.abs(data.lastClose - data.lastOpen), point);
+    const upperWick = Math.max(0, data.lastHigh - Math.max(data.lastOpen, data.lastClose));
+    const lowerWick = Math.max(0, Math.min(data.lastOpen, data.lastClose) - data.lastLow);
+    const bullishEngulfing =
+      data.lastClose > data.lastOpen &&
+      data.prevClose < data.prevOpen &&
+      data.lastOpen <= data.prevClose &&
+      data.lastClose >= data.prevOpen;
+    const bearishEngulfing =
+      data.lastClose < data.lastOpen &&
+      data.prevClose > data.prevOpen &&
+      data.lastOpen >= data.prevClose &&
+      data.lastClose <= data.prevOpen;
+    const bullishRejection = data.lastClose > data.lastOpen && lowerWick >= candleBody * 1.5 && upperWick <= candleBody * 0.8;
+    const bearishRejection = data.lastClose < data.lastOpen && upperWick >= candleBody * 1.5 && lowerWick <= candleBody * 0.8;
+    const patternOk = side === "BUY" ? bullishEngulfing || bullishRejection : bearishEngulfing || bearishRejection;
+    const patternLabel =
+      side === "BUY"
+        ? bullishEngulfing
+          ? "bullish engulfing"
+          : bullishRejection
+          ? "bullish rejection"
+          : "no bullish rejection/engulfing"
+        : bearishEngulfing
+        ? "bearish engulfing"
+        : bearishRejection
+        ? "bearish rejection"
+        : "no bearish rejection/engulfing";
+    return {
+      nearStructure: zoneDistance <= zoneBuffer,
+      zoneDistance,
+      zoneBuffer,
+      zoneAtrRatio: atrValue > 0 ? zoneDistance / atrValue : Number.NaN,
+      maOk,
+      rsiOk,
+      patternOk,
+      patternLabel,
     };
   };
 
@@ -918,8 +1192,145 @@ export const createHeadlessTrader = async (options) => {
     return buildPriceDataFromCandles(symbol, candles);
   };
 
-  const evaluateCooldownReentryConfirmation = async (symbol, side) => {
-    const reentryMode = String(state.config.auto.reentryMode || "BALANCED").toUpperCase();
+  const getManagedWatchItem = (symbol, config = state.config) =>
+    (Array.isArray(config?.watchlist) ? config.watchlist : []).find((item) => symbolsMatch(item?.symbol, symbol)) || null;
+
+  const getManagedProtectionRiskDistanceCap = async (symbol, lots, maxRiskUsd) => {
+    if (!(Number.isFinite(lots) && lots > 0 && Number.isFinite(maxRiskUsd) && maxRiskUsd > 0)) {
+      return Number.NaN;
+    }
+    const specResult = await readMt4SymbolSpecs({ symbol });
+    const spec = specResult.ok ? specResult.spec : null;
+    const tickValue = Number(spec?.tickValue || 0);
+    const tickSize = Number(spec?.tickSize || 0);
+    const point = Number(spec?.point || 0);
+    const lotSize = Number(spec?.lotSize || 0);
+    let moneyPerPricePerLot = 0;
+    if (Number.isFinite(tickValue) && tickValue > 0 && Number.isFinite(tickSize) && tickSize > 0) {
+      moneyPerPricePerLot = tickValue / tickSize;
+    } else if (Number.isFinite(tickValue) && tickValue > 0 && Number.isFinite(point) && point > 0) {
+      moneyPerPricePerLot = tickValue / point;
+    } else if (Number.isFinite(lotSize) && lotSize > 0) {
+      moneyPerPricePerLot = lotSize;
+    }
+    return moneyPerPricePerLot > 0 ? maxRiskUsd / (moneyPerPricePerLot * lots) : Number.NaN;
+  };
+
+  const buildMissingProtectionPlan = async (position, side, tick, autoConfig = getEffectiveAutoConfig(position.symbol)) => {
+    const missingSl = !(Number(position.sl) > 0);
+    const missingTp = !(Number(position.tp) > 0);
+    if (!missingSl && !missingTp) return null;
+
+    const watchItem = getManagedWatchItem(position.symbol);
+    if (!watchItem) return null;
+
+    const entry = Number(position.openPrice);
+    if (!Number.isFinite(entry) || entry <= 0) return null;
+
+    const timeframe = toChartTimeframe(watchItem.timeframe, toChartTimeframe(autoConfig.entryTimeframe, "M15"));
+    const data = await generatePriceData(watchItem.symbol, timeframe);
+    if (!data) return null;
+
+    const current = Number(tick?.mid ?? data.current);
+    const point = getPointSizeForSymbol(position.symbol, current || entry);
+    const atrValue =
+      Number.isFinite(data.atr) && data.atr > 0
+        ? data.atr
+        : Math.max(Math.abs(data.high - data.low) / 14, point * 20);
+    const minSlPoints = Math.max(1, Number(autoConfig.minSlPoints) || getMinSlPointsForSymbol(position.symbol, autoConfig));
+    const atrBufferMult = Math.max(0, Number(autoConfig.atrBufferMult) || 0.25);
+    const minRR = Math.max(0.5, Number(autoConfig.minRR) || 1.0);
+    const minStopDistance = Math.max(point * minSlPoints, atrValue * 0.35);
+    const structureBuffer = Math.max(point * 3, atrValue * atrBufferMult);
+    const structureLevel =
+      side === "BUY"
+        ? Math.min(Number(data.supportLevel), Number(data.swingLow))
+        : Math.max(Number(data.resistanceLevel), Number(data.swingHigh));
+
+    let computedSl = Number(position.sl);
+    if (missingSl) {
+      if (!Number.isFinite(structureLevel) || structureLevel <= 0) return null;
+      computedSl =
+        side === "BUY"
+          ? Math.min(structureLevel - structureBuffer, entry - point, current - minStopDistance)
+          : Math.max(structureLevel + structureBuffer, entry + point, current + minStopDistance);
+      const lots = Number(position.lots);
+      const maxRiskDistance = await getManagedProtectionRiskDistanceCap(
+        position.symbol,
+        lots,
+        MANAGED_PROTECT_MAX_RISK_USD
+      );
+      if (Number.isFinite(maxRiskDistance) && maxRiskDistance > point) {
+        const cappedSl = side === "BUY" ? entry - maxRiskDistance : entry + maxRiskDistance;
+        computedSl = side === "BUY" ? Math.max(computedSl, cappedSl) : Math.min(computedSl, cappedSl);
+      }
+    }
+
+    if (!Number.isFinite(computedSl) || computedSl <= 0) return null;
+    if (missingSl) {
+      if (side === "BUY" && !(computedSl < entry - point)) return null;
+      if (side === "SELL" && !(computedSl > entry + point)) return null;
+      if (tick && side === "BUY" && !(computedSl < tick.bid - point)) return null;
+      if (tick && side === "SELL" && !(computedSl > tick.ask + point)) return null;
+    }
+
+    const rawRiskDistance = side === "BUY" ? entry - computedSl : computedSl - entry;
+    const riskDistance =
+      Number.isFinite(rawRiskDistance) && rawRiskDistance > point
+        ? rawRiskDistance
+        : minStopDistance;
+    if (!Number.isFinite(riskDistance) || riskDistance <= point) return null;
+
+    const existingTp = Number(position.tp);
+    let finalTp = existingTp;
+    let tpSource = "RR";
+    if (missingTp) {
+      const structureTarget = getDirectionalStructureTarget(side, data, entry, point);
+      const structureTargetValue = Number(structureTarget);
+      const structureTpOk =
+        Number.isFinite(structureTargetValue) &&
+        ((side === "BUY" && structureTargetValue > Math.max(entry + point, current + point)) ||
+          (side === "SELL" && structureTargetValue < Math.min(entry - point, current - point)));
+      const rrTarget = side === "BUY" ? entry + riskDistance * minRR : entry - riskDistance * minRR;
+      const fallbackTp = side === "BUY" ? Math.max(rrTarget, current + point) : Math.min(rrTarget, current - point);
+      const structureRewardDistance = side === "BUY" ? structureTargetValue - entry : entry - structureTargetValue;
+      const structureRr =
+        structureTpOk && Number.isFinite(structureRewardDistance) && structureRewardDistance > point
+          ? structureRewardDistance / riskDistance
+          : Number.NaN;
+      if (structureTpOk && Number.isFinite(structureRr) && structureRr >= minRR) {
+        finalTp = structureTargetValue;
+        tpSource = "STRUCTURE";
+      } else {
+        finalTp = fallbackTp;
+      }
+    }
+
+    if (!Number.isFinite(finalTp) || finalTp <= 0) return null;
+    if (side === "BUY" && !(finalTp > entry + point)) return null;
+    if (side === "SELL" && !(finalTp < entry - point)) return null;
+    if (tick && side === "BUY" && !(finalTp > tick.ask + point)) return null;
+    if (tick && side === "SELL" && !(finalTp < tick.bid - point)) return null;
+
+    const rewardDistance = side === "BUY" ? finalTp - entry : entry - finalTp;
+    const rr =
+      Number.isFinite(rewardDistance) && rewardDistance > point
+        ? rewardDistance / riskDistance
+        : Number.NaN;
+    if (!Number.isFinite(rr) || rr <= 0) return null;
+
+    return {
+      symbol: watchItem.symbol,
+      timeframe,
+      sl: computedSl,
+      tp: finalTp,
+      rr,
+      tpSource,
+    };
+  };
+
+  const evaluateCooldownReentryConfirmation = async (symbol, side, autoConfig = state.config.auto) => {
+    const reentryMode = String(autoConfig.reentryMode || "BALANCED").toUpperCase();
     if (reentryMode === "OFF") {
       return { ok: true, reason: "Re-entry confirmation disabled" };
     }
@@ -952,7 +1363,7 @@ export const createHeadlessTrader = async (options) => {
       return { ok: false, reason: "M1 confirmation unavailable" };
     }
 
-    const m1Signal = generateTradeSignal(m1Data);
+    const m1Signal = generateTradeSignal(m1Data, autoConfig);
     const m1CandleOk = side === "BUY" ? m1LastClosed.close > m1LastClosed.open : m1LastClosed.close < m1LastClosed.open;
     const m1EmaOk =
       side === "BUY" ? m1LastClosed.close >= m1Data.movingAverage50 : m1LastClosed.close <= m1Data.movingAverage50;
@@ -969,7 +1380,7 @@ export const createHeadlessTrader = async (options) => {
     return { ok: true, reason: `M5 bias and M1 confirmation aligned for ${side}` };
   };
 
-  const generateTradeSignal = (data) => {
+  const generateTradeSignal = (data, autoConfig = state.config.auto) => {
     let signal = "HOLD";
     let strength = "WEAK";
     let confidence = 0;
@@ -1008,10 +1419,10 @@ export const createHeadlessTrader = async (options) => {
     const point = getPointSizeForSymbol(data.symbol, data.current);
     const atrValue =
       Number.isFinite(data.atr) && data.atr > 0 ? data.atr : Math.max(Math.abs(data.high - data.low) / 14, point * 20);
-    const minStopDistance = Math.max(point * getMinSlPointsForSymbol(data.symbol), atrValue * 0.35);
+    const minStopDistance = Math.max(point * getMinSlPointsForSymbol(data.symbol, autoConfig), atrValue * 0.35);
     const structureBuffer = Math.max(
       point * 3,
-      atrValue * Math.max(0, Number(state.config.auto.atrBufferMult) || 0.25)
+      atrValue * Math.max(0, Number(autoConfig.atrBufferMult) || 0.25)
     );
     const entryPrimary = data.current;
     const entryAlternative = signal === "BUY" ? data.supportLevel : data.resistanceLevel;
@@ -1031,12 +1442,17 @@ export const createHeadlessTrader = async (options) => {
     }
     const riskDistance = Math.max(Math.abs(entryPrimary - stopLoss), minStopDistance);
     const targetRR = strength === "STRONG" ? 2.2 : strength === "MODERATE" ? 2.0 : 1.8;
-    const takeProfit =
+    const structureTarget =
+      signal === "BUY" || signal === "SELL"
+        ? getDirectionalStructureTarget(signal, data, entryPrimary, point)
+        : null;
+    const rrTargetPrice =
       signal === "BUY"
         ? entryPrimary + riskDistance * targetRR
         : signal === "SELL"
         ? entryPrimary - riskDistance * targetRR
         : entryPrimary + riskDistance;
+    const takeProfit = structureTarget ?? rrTargetPrice;
     const digits = isCryptoSymbol(data.symbol) ? 2 : 5;
     return {
       symbol: data.symbol,
@@ -1058,17 +1474,17 @@ export const createHeadlessTrader = async (options) => {
     };
   };
 
-  const buildAutoOrderPlan = (symbol, data, signal, liveEntryPrice) => {
+  const buildAutoOrderPlan = (symbol, data, signal, liveEntryPrice, autoConfig = state.config.auto) => {
     const side = signal.signal === "BUY" ? "BUY" : "SELL";
     const point = getPointSizeForSymbol(symbol, data.current);
     const atrValue =
       Number.isFinite(data.atr) && data.atr > 0 ? data.atr : Math.max(Math.abs(data.high - data.low) / 14, point * 20);
-    const minStopDistance = Math.max(point * getMinSlPointsForSymbol(symbol), atrValue * 0.35);
-    const rrTarget = Math.max(1.1, Number(state.config.auto.minRR) || 1.8);
-    const fallbackMinConfidence = Math.max(0, Math.min(100, Number(state.config.auto.fallbackMinConfidence) || 80));
-    const fallbackRrBuffer = Math.max(0, Number(state.config.auto.fallbackRrBuffer) || 0.2);
+    const minStopDistance = Math.max(point * getMinSlPointsForSymbol(symbol, autoConfig), atrValue * 0.35);
+    const rrTarget = Math.max(1.1, Number(autoConfig.minRR) || 1.8);
+    const fallbackMinConfidence = Math.max(0, Math.min(100, Number(autoConfig.fallbackMinConfidence) || 80));
+    const fallbackRrBuffer = Math.max(0, Number(autoConfig.fallbackRrBuffer) || 0.2);
 
-    if (state.config.auto.entryMode === "LIMIT_SR") {
+    if (autoConfig.entryMode === "LIMIT_SR") {
       const structureEntry =
         side === "BUY" ? Math.min(data.supportLevel, data.swingLow) : Math.max(data.resistanceLevel, data.swingHigh);
       const entryBuffer = Math.max(point * 2, atrValue * 0.1);
@@ -1083,7 +1499,23 @@ export const createHeadlessTrader = async (options) => {
         if (side === "BUY" && !(sl < pendingPrice - point)) sl = pendingPrice - minStopDistance;
         if (side === "SELL" && !(sl > pendingPrice + point)) sl = pendingPrice + minStopDistance;
         const riskDistance = Math.max(Math.abs(pendingPrice - sl), minStopDistance);
-        const tp = side === "BUY" ? pendingPrice + riskDistance * rrTarget : pendingPrice - riskDistance * rrTarget;
+        const structureTarget = getDirectionalStructureTarget(side, data, pendingPrice, point);
+        if (!structureTarget) {
+          return {
+            plan: null,
+            blockedReason: "Structure TP unavailable beyond the pending entry; move already extended past the next zone",
+          };
+        }
+        const structureRr = computeEffectiveRR(side, pendingPrice, sl, structureTarget);
+        if (!Number.isFinite(structureRr)) {
+          return { plan: null, blockedReason: "Structure TP R:R unavailable" };
+        }
+        if (structureRr < rrTarget) {
+          return {
+            plan: null,
+            blockedReason: `Structure TP R:R ${structureRr.toFixed(2)} < ${rrTarget.toFixed(2)}`,
+          };
+        }
         return {
           plan: {
             action: "PENDING",
@@ -1091,13 +1523,15 @@ export const createHeadlessTrader = async (options) => {
             orderType: side === "BUY" ? "BUY_LIMIT" : "SELL_LIMIT",
             price: pendingPrice,
             sl,
-            tp,
+            tp: structureTarget,
             entryForRisk: pendingPrice,
             label: `${side} LIMIT @ S/R`,
+            tpSource: "STRUCTURE",
+            rrAtTp: structureRr,
           },
         };
       }
-      if (!state.config.auto.allowMarketFallback) {
+      if (!autoConfig.allowMarketFallback) {
         return { plan: null, blockedReason: "Limit @ S/R invalid and market fallback is disabled" };
       }
       const marketEntry =
@@ -1106,7 +1540,7 @@ export const createHeadlessTrader = async (options) => {
           : Number(data.current || signal.entryPoints.primary);
       const structureBuffer = Math.max(
         point * 3,
-        atrValue * Math.max(0, Number(state.config.auto.atrBufferMult) || 0.25)
+        atrValue * Math.max(0, Number(autoConfig.atrBufferMult) || 0.25)
       );
       let marketSl = Number(signal.stopLoss);
       if (side === "BUY") {
@@ -1126,8 +1560,10 @@ export const createHeadlessTrader = async (options) => {
         slDistance = Math.abs(marketEntry - marketSl);
       }
       const fallbackRiskDistance = Math.max(slDistance, minStopDistance);
+      const structureTarget = getDirectionalStructureTarget(side, data, marketEntry, point);
       const marketTp =
-        side === "BUY" ? marketEntry + fallbackRiskDistance * rrTarget : marketEntry - fallbackRiskDistance * rrTarget;
+        structureTarget ??
+        (side === "BUY" ? marketEntry + fallbackRiskDistance * rrTarget : marketEntry - fallbackRiskDistance * rrTarget);
       const marketRr = computeEffectiveRR(side, marketEntry, marketSl, marketTp);
       if (signal.confidence < fallbackMinConfidence) {
         return {
@@ -1158,6 +1594,8 @@ export const createHeadlessTrader = async (options) => {
           entryForRisk: marketEntry,
           label: `${side} MARKET`,
           fallbackReason: "Fallback to MARKET: invalid limit-at-structure",
+          tpSource: structureTarget ? "STRUCTURE" : "RR",
+          rrAtTp: marketRr,
         },
       };
     }
@@ -1190,6 +1628,8 @@ export const createHeadlessTrader = async (options) => {
         entryForRisk: marketEntry,
         label: `${side} MARKET`,
         fallbackReason: reframedStops ? "SL/TP auto-reframed from live entry (stale signal levels)" : undefined,
+        tpSource: "RR",
+        rrAtTp: computeEffectiveRR(side, marketEntry, marketSl, marketTp),
       },
     };
   };
@@ -1257,18 +1697,40 @@ export const createHeadlessTrader = async (options) => {
     trendCache,
     nowMs,
   }) => {
+    const autoConfig = getEffectiveAutoConfig(symbol);
+    const strategyMode = String(autoConfig.strategyMode || "CLASSIC_STACK").toUpperCase();
+    if (!autoConfig.enabled) {
+      return { eligible: false, reason: "Symbol auto-trade disabled" };
+    }
     const autoTimeframe =
-      state.config.auto.timeframeOverride && state.config.auto.timeframeOverride !== "PANEL"
-        ? state.config.auto.timeframeOverride
+      autoConfig.timeframeOverride && autoConfig.timeframeOverride !== "PANEL"
+        ? autoConfig.timeframeOverride
         : panelTimeframe;
     const dataForOrder = await generatePriceData(symbol, autoTimeframe);
     if (!dataForOrder) {
       return { eligible: false, reason: `No MT4 candle data available for ${symbol} ${autoTimeframe}` };
     }
 
-    const signal = generateTradeSignal(dataForOrder);
+    const signal = generateTradeSignal(dataForOrder, autoConfig);
     if (!signal || signal.signal === "HOLD") {
       return { eligible: false, reason: "No actionable signal" };
+    }
+
+    if (strategyMode === "CLASSIC_STACK") {
+      const biasCacheKey = `${symbol}|${AUTO_BIAS_TIMEFRAME}`;
+      let biasSignal = trendCache.get(biasCacheKey);
+      if (biasSignal === undefined) {
+        const biasData = await generatePriceData(symbol, AUTO_BIAS_TIMEFRAME);
+        biasSignal = biasData ? generateTradeSignal(biasData, autoConfig) : null;
+        trendCache.set(biasCacheKey, biasSignal);
+      }
+      const h4Bias = biasSignal?.signal === "BUY" || biasSignal?.signal === "SELL" ? biasSignal.signal : null;
+      if (h4Bias && signal.signal !== h4Bias) {
+        return {
+          eligible: false,
+          reason: `${AUTO_BIAS_TIMEFRAME} bias is ${h4Bias}; wait for ${h4Bias} entry confirmation`,
+        };
+      }
     }
 
     const resolvedSymbol = await resolveExecutableSymbol(symbol);
@@ -1277,66 +1739,66 @@ export const createHeadlessTrader = async (options) => {
     }
 
     const liveTick = await fetchTick(resolvedSymbol.symbol);
-    const orderPlanResult = buildAutoOrderPlan(symbol, dataForOrder, signal, liveTick?.mid);
+    const orderPlanResult = buildAutoOrderPlan(symbol, dataForOrder, signal, liveTick?.mid, autoConfig);
     const orderPlan = orderPlanResult.plan;
     if (!orderPlan) {
       return { eligible: false, reason: orderPlanResult.blockedReason || "No valid order plan" };
     }
     if (
-      (state.config.auto.sideFilter === "BUY_ONLY" && orderPlan.side !== "BUY") ||
-      (state.config.auto.sideFilter === "SELL_ONLY" && orderPlan.side !== "SELL")
+      (autoConfig.sideFilter === "BUY_ONLY" && orderPlan.side !== "BUY") ||
+      (autoConfig.sideFilter === "SELL_ONLY" && orderPlan.side !== "SELL")
     ) {
       return {
         eligible: false,
-        reason: `Side filter blocked ${orderPlan.side} (${state.config.auto.sideFilter})`,
+        reason: `Side filter blocked ${orderPlan.side} (${autoConfig.sideFilter})`,
       };
     }
 
     let strategyBlockReason = null;
-    if (signal.confidence < Number(state.config.auto.minConfidence)) {
-      strategyBlockReason = `Confidence ${signal.confidence.toFixed(0)}% < ${Number(state.config.auto.minConfidence)}%`;
+    if (signal.confidence < Number(autoConfig.minConfidence)) {
+      strategyBlockReason = `Confidence ${signal.confidence.toFixed(0)}% < ${Number(autoConfig.minConfidence)}%`;
     }
-    if (signal.winRate < Number(state.config.auto.minWinRate) && !strategyBlockReason) {
-      strategyBlockReason = `Win rate ${signal.winRate.toFixed(0)}% < ${Number(state.config.auto.minWinRate)}%`;
+    if (signal.winRate < Number(autoConfig.minWinRate) && !strategyBlockReason) {
+      strategyBlockReason = `Win rate ${signal.winRate.toFixed(0)}% < ${Number(autoConfig.minWinRate)}%`;
     }
     if (signal.noiseState === "HIGH" && !strategyBlockReason) {
       strategyBlockReason = `Noise filter: setup too choppy (${signal.noiseScore.toFixed(0)}%)`;
     }
-    if (state.config.auto.requireStrong && signal.strength !== "STRONG" && !strategyBlockReason) {
+    if (autoConfig.requireStrong && signal.strength !== "STRONG" && !strategyBlockReason) {
       strategyBlockReason = "Signal strength is not STRONG";
     }
     if (!isBrokerSessionOpen(symbol, nowMs) && !strategyBlockReason) {
       strategyBlockReason = "Broker market closed";
     }
-    if (!isAutoSessionWindowOpen(symbol, nowMs) && !strategyBlockReason) {
+    if (!isAutoSessionWindowOpen(symbol, autoConfig, nowMs) && !strategyBlockReason) {
       strategyBlockReason = "Outside configured auto-trade session window";
     }
     if (
-      state.config.protect.overnightEnabled &&
-      state.config.auto.ma200FlatFilterEnabled &&
+      getEffectiveProtectConfig(symbol).overnightEnabled &&
+      autoConfig.ma200FlatFilterEnabled &&
       Number.isFinite(Number(dataForOrder.movingAverage200SlopeAtrRatio)) &&
-      Number(dataForOrder.movingAverage200SlopeAtrRatio) > Number(state.config.auto.ma200FlatMaxAtrRatio) &&
+      Number(dataForOrder.movingAverage200SlopeAtrRatio) > Number(autoConfig.ma200FlatMaxAtrRatio) &&
       !strategyBlockReason
     ) {
       strategyBlockReason =
         `MA200 trend too strong (` +
         `MA200 ${Number(dataForOrder.movingAverage200).toFixed(2)} vs prev ${Number(dataForOrder.movingAverage200Prev).toFixed(2)}, ` +
         `slope ${Number(dataForOrder.movingAverage200Slope).toFixed(2)}, ` +
-        `ATR ratio ${Number(dataForOrder.movingAverage200SlopeAtrRatio).toFixed(2)} > ${Number(state.config.auto.ma200FlatMaxAtrRatio).toFixed(2)}` +
+        `ATR ratio ${Number(dataForOrder.movingAverage200SlopeAtrRatio).toFixed(2)} > ${Number(autoConfig.ma200FlatMaxAtrRatio).toFixed(2)}` +
         `)`;
     }
-    if (currentOpenCount >= Number(state.config.auto.maxOpenTrades) && !strategyBlockReason) {
-      strategyBlockReason = `Max active positions reached (${currentOpenCount}/${state.config.auto.maxOpenTrades})`;
+    if (currentOpenCount >= Number(autoConfig.maxOpenTrades) && !strategyBlockReason) {
+      strategyBlockReason = `Max active positions reached (${currentOpenCount}/${autoConfig.maxOpenTrades})`;
     }
-    if (state.config.auto.adaptiveLearningEnabled) {
+    if (autoConfig.adaptiveLearningEnabled) {
       const symbolKey = normalizeSymbol(symbol);
-      const blockedSymbol = state.config.auto.learnedBlockedSymbols.some(
+      const blockedSymbol = autoConfig.learnedBlockedSymbols.some(
         (item) => item === symbolKey || item.startsWith(symbolKey) || symbolKey.startsWith(item)
       );
       if (blockedSymbol && !strategyBlockReason) {
         strategyBlockReason = "Adaptive filter blocked this symbol";
       }
-      if (state.config.auto.learnedBlockedSessions.includes(classifyAdaptiveSession(nowMs)) && !strategyBlockReason) {
+      if (autoConfig.learnedBlockedSessions.includes(classifyAdaptiveSession(nowMs)) && !strategyBlockReason) {
         strategyBlockReason = "Adaptive filter blocked the current session";
       }
     }
@@ -1347,35 +1809,53 @@ export const createHeadlessTrader = async (options) => {
       strategyBlockReason = "Existing open position on symbol";
     }
 
-    if (state.config.protect.overnightEnabled && !strategyBlockReason) {
+    if (strategyMode === "CLASSIC_STACK" && !strategyBlockReason) {
+      const confirmation = evaluateDirectionalConfirmation(symbol, dataForOrder, orderPlan.side, autoConfig);
+      if (!confirmation.nearStructure) {
+        strategyBlockReason = `Price is not yet at the ${orderPlan.side === "BUY" ? "support" : "resistance"} zone on ${autoTimeframe} (${confirmation.zoneAtrRatio.toFixed(2)} ATR away)`;
+      }
+      if (!confirmation.maOk && !strategyBlockReason) {
+        strategyBlockReason = `${autoTimeframe} MA50 filter blocks ${orderPlan.side}`;
+      }
+      if (!confirmation.rsiOk && !strategyBlockReason) {
+        strategyBlockReason = `${autoTimeframe} RSI is not supportive for ${orderPlan.side} (${Number(dataForOrder.rsi).toFixed(1)})`;
+      }
+      if (!confirmation.patternOk && !strategyBlockReason) {
+        strategyBlockReason = `Need ${orderPlan.side === "BUY" ? "bullish" : "bearish"} rejection or engulfing candle on ${autoTimeframe}`;
+      }
+    }
+
+    if (getEffectiveProtectConfig(symbol).overnightEnabled && !strategyBlockReason) {
       const newsBlock = await computeHighImpactNewsBlock(symbol);
       if (newsBlock.blocked) {
         strategyBlockReason = newsBlock.reason;
       }
     }
 
-    const trendFrames = getTrendFilterFrames(state.config.auto.entryTimeframe);
-    const trendState = {};
-    let aligned = true;
-    for (const tf of trendFrames) {
-      const cacheKey = `${symbol}|${tf}`;
-      let trendSignal = trendCache.get(cacheKey);
-      if (trendSignal === undefined) {
-        const trendData = await generatePriceData(symbol, tf);
-        trendSignal = trendData ? generateTradeSignal(trendData) : null;
-        trendCache.set(cacheKey, trendSignal);
+    if (strategyMode === "CLASSIC_STACK" && autoConfig.enforceTrendStack !== false) {
+      const trendFrames = getTrendFilterFrames(autoConfig.entryTimeframe);
+      const trendState = {};
+      let aligned = true;
+      for (const tf of trendFrames) {
+        const cacheKey = `${symbol}|${tf}`;
+        let trendSignal = trendCache.get(cacheKey);
+        if (trendSignal === undefined) {
+          const trendData = await generatePriceData(symbol, tf);
+          trendSignal = trendData ? generateTradeSignal(trendData, autoConfig) : null;
+          trendCache.set(cacheKey, trendSignal);
+        }
+        trendState[tf] = trendSignal?.signal || "N/A";
+        if (trendState[tf] !== orderPlan.side) aligned = false;
       }
-      trendState[tf] = trendSignal?.signal || "N/A";
-      if (trendState[tf] !== orderPlan.side) aligned = false;
-    }
-    if (!aligned && !strategyBlockReason) {
-      strategyBlockReason = `Trend filter blocked ${orderPlan.side} (${trendFrames
-        .map((frame) => `${frame}=${trendState[frame]}`)
-        .join(", ")})`;
+      if (!aligned && !strategyBlockReason) {
+        strategyBlockReason = `Trend filter blocked ${orderPlan.side} (${trendFrames
+          .map((frame) => `${frame}=${trendState[frame]}`)
+          .join(", ")})`;
+      }
     }
 
     if (!strategyBlockReason) {
-      const reentryConfirmation = await evaluateCooldownReentryConfirmation(symbol, orderPlan.side);
+      const reentryConfirmation = await evaluateCooldownReentryConfirmation(symbol, orderPlan.side, autoConfig);
       if (!reentryConfirmation.ok) {
         strategyBlockReason = reentryConfirmation.reason;
       }
@@ -1384,15 +1864,15 @@ export const createHeadlessTrader = async (options) => {
     if (liveTick) {
       const point = getPointSizeForSymbol(symbol, liveTick.mid);
       const spreadPoints = point > 0 ? Math.max(0, liveTick.ask - liveTick.bid) / point : 0;
-      if (Number.isFinite(spreadPoints) && spreadPoints > getSpreadGuardPointsForSymbol(symbol) && !strategyBlockReason) {
+      if (Number.isFinite(spreadPoints) && spreadPoints > getSpreadGuardPointsForSymbol(symbol, autoConfig) && !strategyBlockReason) {
         strategyBlockReason = `Spread guard: ${spreadPoints.toFixed(1)} pts`;
       }
     }
 
-    let lots = Number(state.config.auto.botLots);
+    let lots = Number(autoConfig.botLots);
     let rawRiskLot;
     let actualRiskLot;
-    if (state.config.auto.useDynamicLot) {
+    if (autoConfig.useDynamicLot) {
       if (accountRiskBase <= 0) {
         return { eligible: false, reason: "Account snapshot unavailable for dynamic lot" };
       }
@@ -1426,9 +1906,9 @@ export const createHeadlessTrader = async (options) => {
       }
 
       const riskAmount =
-        state.config.auto.riskMode === "USD"
-          ? Number(state.config.auto.riskUsd)
-          : accountRiskBase * (Number(state.config.auto.riskPct) / 100);
+        autoConfig.riskMode === "USD"
+          ? Number(autoConfig.riskUsd)
+          : accountRiskBase * (Number(autoConfig.riskPct) / 100);
       let riskPerLot = (slDistance / spec.tickSize) * spec.tickValue;
       if (!Number.isFinite(riskPerLot) || riskPerLot <= 0) {
         return { eligible: false, reason: "Invalid risk-per-lot" };
@@ -1440,11 +1920,11 @@ export const createHeadlessTrader = async (options) => {
         return { eligible: false, reason: "Lot calculation failed" };
       }
 
-      const minLot = Number(state.config.auto.minLot);
-      const lotStep = Number(state.config.auto.lotStep);
+      const minLot = Number(autoConfig.minLot);
+      const lotStep = Number(autoConfig.lotStep);
       if (rawLots < minLot) {
         const pointSize = getPointSizeForSymbol(symbol, entry);
-        const minDistanceByPoints = Math.max(pointSize, pointSize * getMinSlPointsForSymbol(symbol));
+        const minDistanceByPoints = Math.max(pointSize, pointSize * getMinSlPointsForSymbol(symbol, autoConfig));
         const requiredRiskPerLot = riskAmount / minLot;
         const requiredSlDistance = requiredRiskPerLot * (spec.tickSize / spec.tickValue);
         const adjustedSlDistance = Math.max(minDistanceByPoints, requiredSlDistance);
@@ -1478,8 +1958,8 @@ export const createHeadlessTrader = async (options) => {
       }
 
       const normalizedCap =
-        Number.isFinite(Number(state.config.auto.botLots)) && Number(state.config.auto.botLots) > 0
-          ? Number(state.config.auto.botLots)
+        Number.isFinite(Number(autoConfig.botLots)) && Number(autoConfig.botLots) > 0
+          ? Number(autoConfig.botLots)
           : 5;
       const decimals = Math.max(2, String(lotStep).split(".")[1]?.length || 0);
       const minStepMultiple = Math.max(1, Math.ceil(minLot / lotStep - 1e-9));
@@ -1492,15 +1972,15 @@ export const createHeadlessTrader = async (options) => {
 
       const projectedRiskUsd = riskPerLot * lots;
       const targetRiskUsd =
-        state.config.auto.riskMode === "USD"
-          ? Number(state.config.auto.riskUsd)
+        autoConfig.riskMode === "USD"
+          ? Number(autoConfig.riskUsd)
           : accountRiskBase > 0
-          ? accountRiskBase * (Number(state.config.auto.riskPct) / 100)
+          ? accountRiskBase * (Number(autoConfig.riskPct) / 100)
           : 0;
       if (
         targetRiskUsd > 0 &&
-        projectedRiskUsd > targetRiskUsd * Number(state.config.auto.riskGuardMult) &&
-        state.config.auto.enforceHardRiskBlock
+        projectedRiskUsd > targetRiskUsd * Number(autoConfig.riskGuardMult) &&
+        autoConfig.enforceHardRiskBlock
       ) {
         return {
           eligible: false,
@@ -1509,12 +1989,12 @@ export const createHeadlessTrader = async (options) => {
       }
     }
 
-    const lotDecimals = Math.max(2, String(state.config.auto.lotStep).split(".")[1]?.length || 0);
+    const lotDecimals = Math.max(2, String(autoConfig.lotStep).split(".")[1]?.length || 0);
     const minStepMultipleFinal = Math.max(
       1,
-      Math.ceil(Number(state.config.auto.minLot) / Number(state.config.auto.lotStep) - 1e-9)
+      Math.ceil(Number(autoConfig.minLot) / Number(autoConfig.lotStep) - 1e-9)
     );
-    const minStepLotFinal = Number((minStepMultipleFinal * Number(state.config.auto.lotStep)).toFixed(lotDecimals));
+    const minStepLotFinal = Number((minStepMultipleFinal * Number(autoConfig.lotStep)).toFixed(lotDecimals));
     if (Number.isFinite(lots) && lots > 0 && lots < minStepLotFinal) {
       lots = minStepLotFinal;
       actualRiskLot = lots;
@@ -1523,13 +2003,43 @@ export const createHeadlessTrader = async (options) => {
       return { eligible: false, reason: "Invalid lot size" };
     }
 
+    const aggressiveTpSpecResult = await readMt4SymbolSpecs({ symbol: resolvedSymbol.symbol });
+    if (aggressiveTpSpecResult.ok && aggressiveTpSpecResult.spec) {
+      const entry = Number(orderPlan.entryForRisk);
+      const point = getPointSizeForSymbol(symbol, entry);
+      const moneyPerPricePerLot = computeMoneyPerPricePerLot(
+        Number(aggressiveTpSpecResult.spec.tickValue || 0),
+        Number(aggressiveTpSpecResult.spec.tickSize || 0),
+        Number(aggressiveTpSpecResult.spec.point || 0),
+        Number(aggressiveTpSpecResult.spec.lotSize || 0)
+      );
+      if (
+        Number.isFinite(entry) &&
+        entry > 0 &&
+        Number.isFinite(lots) &&
+        lots > 0 &&
+        Number.isFinite(moneyPerPricePerLot) &&
+        moneyPerPricePerLot > 0
+      ) {
+        const targetDistance = Math.max(point, AGGRESSIVE_AUTO_TP_TARGET_USD / (moneyPerPricePerLot * lots));
+        const fixedTp = orderPlan.side === "BUY" ? entry + targetDistance : entry - targetDistance;
+        if (Number.isFinite(fixedTp) && fixedTp > 0) {
+          orderPlan.tp = fixedTp;
+          orderPlan.tpSource = "RR";
+          orderPlan.fallbackReason = orderPlan.fallbackReason
+            ? `${orderPlan.fallbackReason}; TP targets ~$${AGGRESSIVE_AUTO_TP_TARGET_USD.toFixed(2)}`
+            : `TP targets ~$${AGGRESSIVE_AUTO_TP_TARGET_USD.toFixed(2)}`;
+        }
+      }
+    }
+
     const rrRatio = Number(
       computeEffectiveRR(orderPlan.side, Number(orderPlan.entryForRisk), Number(orderPlan.sl), Number(orderPlan.tp)).toFixed(2)
     );
     if (!Number.isFinite(rrRatio)) {
       if (!strategyBlockReason) strategyBlockReason = "R:R unavailable";
-    } else if (rrRatio < Number(state.config.auto.minRR) && !strategyBlockReason) {
-      strategyBlockReason = `R:R ${rrRatio.toFixed(2)} < ${Number(state.config.auto.minRR)}`;
+    } else if (rrRatio < Number(autoConfig.minRR) && !strategyBlockReason) {
+      strategyBlockReason = `R:R ${rrRatio.toFixed(2)} < ${Number(autoConfig.minRR)}`;
     }
 
     const policyPayload = {
@@ -1538,10 +2048,10 @@ export const createHeadlessTrader = async (options) => {
       lots,
       sl: orderPlan.sl,
       tp: orderPlan.tp,
-      symbolCooldownSec: state.config.auto.enforceSymbolCooldown ? Number(state.config.auto.cooldownMin) * 60 : 0,
-      enforceSymbolCooldown: state.config.auto.enforceSymbolCooldown,
-      enforceDailyLossLimit: state.config.auto.enforceDailyLossLimit,
-      comment: `${state.config.auto.commentTag}-${autoTimeframe}`,
+      symbolCooldownSec: autoConfig.enforceSymbolCooldown ? Number(autoConfig.cooldownMin) * 60 : 0,
+      enforceSymbolCooldown: autoConfig.enforceSymbolCooldown,
+      enforceDailyLossLimit: autoConfig.enforceDailyLossLimit,
+      comment: `${autoConfig.commentTag}-${autoTimeframe}`,
     };
     if (orderPlan.action === "PLACE") {
       policyPayload.side = orderPlan.side;
@@ -1585,11 +2095,12 @@ export const createHeadlessTrader = async (options) => {
       rawRiskLot,
       actualRiskLot,
       autoTimeframe,
+      autoConfig,
     };
   };
 
   const runAutoScan = async () => {
-    if (!state.config.auto.enabled || state.autoBusy) return { ok: true, skipped: true };
+    if (!hasAnyAutoEnabled() || state.autoBusy) return { ok: true, skipped: true };
     if (state.overnightLossGuard.active) {
       state.autoStatus =
         state.overnightLossGuard.stopReason ||
@@ -1603,7 +2114,12 @@ export const createHeadlessTrader = async (options) => {
       const positions = openResult.ok && Array.isArray(openResult.positions) ? openResult.positions : [];
       let currentOpenCount = positions.length;
       let accountRiskBase = 0;
-      if (state.config.auto.useDynamicLot || state.config.auto.riskMode === "PCT") {
+      if (
+        state.config.watchlist.some((item) => {
+          const autoConfig = getEffectiveAutoConfig(item.symbol);
+          return autoConfig.enabled && (autoConfig.useDynamicLot || autoConfig.riskMode === "PCT");
+        })
+      ) {
         const accountResult = await readMt4AccountSnapshot();
         if (accountResult.ok && accountResult.account) {
           const balance = Number(accountResult.account.balance || 0);
@@ -1622,6 +2138,11 @@ export const createHeadlessTrader = async (options) => {
       for (const item of state.config.watchlist) {
         const symbol = item.symbol;
         const panelTimeframe = item.timeframe;
+        const autoConfig = getEffectiveAutoConfig(symbol);
+        if (!autoConfig.enabled) {
+          skipped.push(`${symbol}: skipped - symbol auto-trade disabled`);
+          continue;
+        }
         const lockKey = normalizeSymbol(symbol).replace(/M$/, "");
         if (executedLocks.has(lockKey)) {
           skipped.push(`${symbol}: skipped - symbol lock active for current scan`);
@@ -1652,7 +2173,7 @@ export const createHeadlessTrader = async (options) => {
           }
           const point = getPointSizeForSymbol(symbol, preSendTick.mid);
           const spreadPoints = point > 0 ? Math.max(0, preSendTick.ask - preSendTick.bid) / point : 0;
-          if (Number.isFinite(spreadPoints) && spreadPoints > getSpreadGuardPointsForSymbol(symbol)) {
+          if (Number.isFinite(spreadPoints) && spreadPoints > getSpreadGuardPointsForSymbol(symbol, evaluation.autoConfig)) {
             skipped.push(`${symbol}: skipped - spread guard ${spreadPoints.toFixed(1)} pts`);
             continue;
           }
@@ -1670,10 +2191,10 @@ export const createHeadlessTrader = async (options) => {
           lots: evaluation.lots,
           sl: evaluation.orderPlan.sl,
           tp: evaluation.orderPlan.tp,
-          symbolCooldownSec: state.config.auto.enforceSymbolCooldown ? Number(state.config.auto.cooldownMin) * 60 : 0,
-          enforceSymbolCooldown: state.config.auto.enforceSymbolCooldown,
-          enforceDailyLossLimit: state.config.auto.enforceDailyLossLimit,
-          comment: `${state.config.auto.commentTag}-${evaluation.autoTimeframe || panelTimeframe}`,
+          symbolCooldownSec: evaluation.autoConfig.enforceSymbolCooldown ? Number(evaluation.autoConfig.cooldownMin) * 60 : 0,
+          enforceSymbolCooldown: evaluation.autoConfig.enforceSymbolCooldown,
+          enforceDailyLossLimit: evaluation.autoConfig.enforceDailyLossLimit,
+          comment: `${evaluation.autoConfig.commentTag}-${evaluation.autoTimeframe || panelTimeframe}`,
         };
         if (evaluation.orderPlan.action === "PLACE") {
           payload.side = evaluation.orderPlan.side;
@@ -1685,13 +2206,13 @@ export const createHeadlessTrader = async (options) => {
         pushAudit(
           symbol,
           "PREPARE_SENT",
-          `${evaluation.orderPlan.label} lots=${evaluation.lots} sl=${formatNumericPrice(symbol, evaluation.orderPlan.sl)} tp=${formatNumericPrice(symbol, evaluation.orderPlan.tp)}`
+          `${evaluation.orderPlan.label} lots=${evaluation.lots} sl=${formatNumericPrice(symbol, evaluation.orderPlan.sl)} tp=${formatNumericPrice(symbol, evaluation.orderPlan.tp)}${evaluation.orderPlan.rrAtTp ? ` rr=${Number(evaluation.orderPlan.rrAtTp).toFixed(2)}` : ""}${evaluation.orderPlan.tpSource ? ` tpSource=${String(evaluation.orderPlan.tpSource).toLowerCase()}` : ""}`
         );
 
         const result = await executeValidatedRequest(payload, {
           symbol,
           successStage: "EXECUTION_OK",
-          successMessage: `${evaluation.orderPlan.label} lots=${evaluation.lots}`,
+          successMessage: `${evaluation.orderPlan.label} lots=${evaluation.lots}${evaluation.orderPlan.rrAtTp ? ` rr=${Number(evaluation.orderPlan.rrAtTp).toFixed(2)}` : ""}${evaluation.orderPlan.tpSource ? ` tpSource=${String(evaluation.orderPlan.tpSource).toLowerCase()}` : ""}`,
           failureStage: "EXECUTION_FAIL",
         });
 
@@ -1728,7 +2249,7 @@ export const createHeadlessTrader = async (options) => {
   };
 
   const runProtectLoop = async () => {
-    if ((!state.config.protect.enabled && !state.config.protect.overnightEnabled) || state.protectBusy) {
+    if (!hasAnyProtectEnabled() || state.protectBusy) {
       return { ok: true, skipped: true };
     }
     state.protectBusy = true;
@@ -1750,19 +2271,6 @@ export const createHeadlessTrader = async (options) => {
       const failures = [];
       const signalCache = new Map();
       const specCache = new Map();
-      const graceMs = Number(state.config.protect.graceMin) * 60 * 1000;
-      const overnightProfitUsd = Number(state.config.protect.overnightProfitUsd);
-      const overnightLossUsd = Number(state.config.protect.overnightLossUsd);
-      const breakEvenProfitUsd = Number(state.config.protect.breakEvenProfitUsd);
-      const overnightProfitRetraceLockEnabled = Boolean(state.config.protect.overnightProfitRetraceLockEnabled);
-      const overnightProfitRetraceArmUsd = Math.max(
-        0.01,
-        Number(state.config.protect.overnightProfitRetraceArmUsd) || 0.8
-      );
-      const overnightProfitRetraceCloseUsd = Math.max(
-        0.01,
-        Number(state.config.protect.overnightProfitRetraceCloseUsd) || 0.4
-      );
       const openTickets = new Set(positions.map((position) => String(position.ticket)));
       for (const ticket of Array.from(state.overnightProfitRetraceState.keys())) {
         if (!openTickets.has(String(ticket))) {
@@ -1773,6 +2281,22 @@ export const createHeadlessTrader = async (options) => {
       for (const position of positions) {
         const side = String(position.type || "").toUpperCase();
         if (side !== "BUY" && side !== "SELL") continue;
+        const protectConfig = getEffectiveProtectConfig(position.symbol);
+        const autoConfig = getEffectiveAutoConfig(position.symbol);
+        if (!protectConfig.enabled && !protectConfig.overnightEnabled) continue;
+        const graceMs = Number(protectConfig.graceMin) * 60 * 1000;
+        const overnightProfitUsd = Number(protectConfig.overnightProfitUsd);
+        const overnightLossUsd = Number(protectConfig.overnightLossUsd);
+        const breakEvenProfitUsd = Number(protectConfig.breakEvenProfitUsd);
+        const overnightProfitRetraceLockEnabled = Boolean(protectConfig.overnightProfitRetraceLockEnabled);
+        const overnightProfitRetraceArmUsd = Math.max(
+          0.01,
+          Number(protectConfig.overnightProfitRetraceArmUsd) || 0.8
+        );
+        const overnightProfitRetraceCloseUsd = Math.max(
+          0.01,
+          Number(protectConfig.overnightProfitRetraceCloseUsd) || 0.4
+        );
         const tick = await fetchTick(position.symbol);
 
         let floatingPnl = Number.NaN;
@@ -1807,7 +2331,7 @@ export const createHeadlessTrader = async (options) => {
               side === "BUY"
                 ? (closePrice - entry) * moneyPerPricePerLot * lots
                 : (entry - closePrice) * moneyPerPricePerLot * lots;
-            if (state.config.protect.overnightEnabled && Number.isFinite(floatingPnl)) {
+            if (protectConfig.overnightEnabled && Number.isFinite(floatingPnl)) {
               const retraceState = state.overnightProfitRetraceState.get(position.ticket) || {
                 armed: false,
                 peakProfitUsd: Number.NEGATIVE_INFINITY,
@@ -1819,7 +2343,7 @@ export const createHeadlessTrader = async (options) => {
               state.overnightProfitRetraceState.set(position.ticket, retraceState);
             }
             if (
-              state.config.protect.overnightEnabled &&
+              protectConfig.overnightEnabled &&
               Number.isFinite(floatingPnl) &&
               overnightLossUsd > 0 &&
               floatingPnl <= -Math.abs(overnightLossUsd)
@@ -1846,7 +2370,7 @@ export const createHeadlessTrader = async (options) => {
               failures.push(`${position.symbol}: ${closeResult.error || "overnight loss close failed"}`);
             }
             if (
-              state.config.protect.overnightEnabled &&
+              protectConfig.overnightEnabled &&
               Number.isFinite(floatingPnl) &&
               floatingPnl >= overnightProfitUsd
             ) {
@@ -1873,7 +2397,7 @@ export const createHeadlessTrader = async (options) => {
             }
             const retraceState = state.overnightProfitRetraceState.get(position.ticket);
             if (
-              state.config.protect.overnightEnabled &&
+              protectConfig.overnightEnabled &&
               overnightProfitRetraceLockEnabled &&
               retraceState?.armed &&
               Number.isFinite(floatingPnl) &&
@@ -1905,10 +2429,44 @@ export const createHeadlessTrader = async (options) => {
           }
         }
 
-        if (state.config.protect.enabled && state.config.protect.breakEvenEnabled && Number.isFinite(tick?.mid)) {
+        const missingProtectionPlan = await buildMissingProtectionPlan(position, side, tick, autoConfig);
+        if (missingProtectionPlan) {
+          const missingLabel =
+            !(Number(position.sl) > 0) && !(Number(position.tp) > 0)
+              ? "SL/TP"
+              : !(Number(position.sl) > 0)
+              ? "SL"
+              : "TP";
+          const modifyResult = await executeValidatedRequest(
+            {
+              action: "MODIFY",
+              ticket: position.ticket,
+              sl: missingProtectionPlan.sl,
+              tp: missingProtectionPlan.tp,
+            },
+            {
+              symbol: position.symbol,
+              successStage: "EXECUTION_OK",
+              successMessage:
+                `${position.symbol} #${position.ticket} auto-filled ${missingLabel} via ${missingProtectionPlan.symbol} ${missingProtectionPlan.timeframe} ` +
+                `(${String(missingProtectionPlan.tpSource).toLowerCase()} TP, R:R ${Number(missingProtectionPlan.rr).toFixed(2)})`,
+              failureStage: "EXECUTION_FAIL",
+            }
+          );
+          if (modifyResult.ok) {
+            updates.push(
+              `${position.symbol} #${position.ticket} auto-filled ${missingLabel} via ${missingProtectionPlan.symbol} ${missingProtectionPlan.timeframe} ` +
+                `(${String(missingProtectionPlan.tpSource).toLowerCase()} TP, R:R ${Number(missingProtectionPlan.rr).toFixed(2)})`
+            );
+            continue;
+          }
+          failures.push(`${position.symbol}: ${modifyResult.error || "missing SL/TP autofill failed"}`);
+        }
+
+        if (protectConfig.enabled && protectConfig.breakEvenEnabled && Number.isFinite(tick?.mid)) {
           const current = Number(tick.mid);
           const pointSize = getPointSizeForSymbol(position.symbol, current);
-          const minDistance = Number(state.config.protect.minStopPoints) * pointSize;
+          const minDistance = Number(protectConfig.minStopPoints) * pointSize;
           const entry = Number(position.openPrice);
           const currentSl = Number(position.sl);
           const originalRiskDistance = side === "BUY" ? entry - currentSl : currentSl - entry;
@@ -1917,9 +2475,9 @@ export const createHeadlessTrader = async (options) => {
             Number.isFinite(originalRiskDistance) &&
             originalRiskDistance > 0 &&
             Number.isFinite(favorableDistance) &&
-            favorableDistance >= originalRiskDistance * Number(state.config.protect.breakEvenR);
+            favorableDistance >= originalRiskDistance * Number(protectConfig.breakEvenR);
           const beReadyByUsd =
-            state.config.protect.overnightEnabled &&
+            protectConfig.overnightEnabled &&
             Number.isFinite(floatingPnl) &&
             breakEvenProfitUsd > 0 &&
             floatingPnl >= breakEvenProfitUsd;
@@ -1963,33 +2521,33 @@ export const createHeadlessTrader = async (options) => {
         }
 
         if (position.openTime && Date.now() - Number(position.openTime) * 1000 < graceMs) continue;
-        if (!state.config.protect.enabled) continue;
+        if (!protectConfig.enabled) continue;
 
         const candles = await fetchCandles(
           position.symbol,
-          state.config.protect.timeframe,
-          Math.max(Number(state.config.protect.lookback) + Number(state.config.protect.atrPeriod) + 5, 60)
+          protectConfig.timeframe,
+          Math.max(Number(protectConfig.lookback) + Number(protectConfig.atrPeriod) + 5, 60)
         );
-        if (candles.length < Number(state.config.protect.lookback) + 5) continue;
+        if (candles.length < Number(protectConfig.lookback) + 5) continue;
 
-        const atr = computeAtr(candles, Number(state.config.protect.atrPeriod));
+        const atr = computeAtr(candles, Number(protectConfig.atrPeriod));
         if (!Number.isFinite(atr) || atr <= 0) continue;
 
         const closes = candles.map((candle) => candle.close);
-        const recentCloses = closes.slice(-Number(state.config.protect.lookback));
+        const recentCloses = closes.slice(-Number(protectConfig.lookback));
         const highestClose = Math.max(...recentCloses);
         const lowestClose = Math.min(...recentCloses);
         const current = tick?.mid ?? closes[closes.length - 1];
         if (!Number.isFinite(current)) continue;
         const pointSize = getPointSizeForSymbol(position.symbol, current);
-        const minDistance = Number(state.config.protect.minStopPoints) * pointSize;
+        const minDistance = Number(protectConfig.minStopPoints) * pointSize;
 
-        if (state.config.protect.degradeCloseEnabled) {
-          const signalKey = `${position.symbol}|${state.config.protect.timeframe}`;
+        if (protectConfig.degradeCloseEnabled) {
+          const signalKey = `${position.symbol}|${protectConfig.timeframe}`;
           let protectSignal = signalCache.get(signalKey);
           if (protectSignal === undefined) {
-            const protectData = await generatePriceData(position.symbol, state.config.protect.timeframe);
-            protectSignal = protectData ? generateTradeSignal(protectData) : null;
+            const protectData = await generatePriceData(position.symbol, protectConfig.timeframe);
+            protectSignal = protectData ? generateTradeSignal(protectData, autoConfig) : null;
             signalCache.set(signalKey, protectSignal);
           }
           const isOpposite =
@@ -1997,7 +2555,7 @@ export const createHeadlessTrader = async (options) => {
             (protectSignal.signal === "BUY" || protectSignal.signal === "SELL") &&
             ((side === "BUY" && protectSignal.signal === "SELL") ||
               (side === "SELL" && protectSignal.signal === "BUY"));
-          if (isOpposite && (protectSignal?.confidence || 0) >= Number(state.config.protect.degradeMinConfidence)) {
+          if (isOpposite && (protectSignal?.confidence || 0) >= Number(protectConfig.degradeMinConfidence)) {
             const tp = Number(position.tp);
             const entry = Number(position.openPrice);
             const tpDistance =
@@ -2008,8 +2566,8 @@ export const createHeadlessTrader = async (options) => {
               Number.isFinite(tpDistance) && tpDistance > 0 && Number.isFinite(favorableDistance)
                 ? (favorableDistance / tpDistance) * 100
                 : Number.NaN;
-            const biasFlipProfitLockEnabled = Boolean(state.config.protect.biasFlipProfitLockEnabled);
-            const biasFlipTpProgressPct = Math.max(1, Number(state.config.protect.biasFlipTpProgressPct) || 35);
+            const biasFlipProfitLockEnabled = Boolean(protectConfig.biasFlipProfitLockEnabled);
+            const biasFlipTpProgressPct = Math.max(1, Number(protectConfig.biasFlipTpProgressPct) || 35);
             const eligibleForProfitLock =
               biasFlipProfitLockEnabled &&
               Number.isFinite(floatingPnl) &&
@@ -2046,14 +2604,14 @@ export const createHeadlessTrader = async (options) => {
 
         let nextSl = null;
         if (side === "BUY") {
-          const trail = highestClose - Number(state.config.protect.atrMult) * atr;
+          const trail = highestClose - Number(protectConfig.atrMult) * atr;
           if (trail <= Number(position.openPrice)) continue;
           if (tick && trail >= tick.bid) continue;
           if (position.sl && trail <= Number(position.sl)) continue;
           if (minDistance > 0 && current - trail < minDistance) continue;
           nextSl = trail;
         } else {
-          const trail = lowestClose + Number(state.config.protect.atrMult) * atr;
+          const trail = lowestClose + Number(protectConfig.atrMult) * atr;
           if (trail >= Number(position.openPrice)) continue;
           if (tick && trail <= tick.ask) continue;
           if (position.sl && trail >= Number(position.sl)) continue;
@@ -2096,7 +2654,7 @@ export const createHeadlessTrader = async (options) => {
       } else {
         state.protectStatus = state.overnightLossGuard.active
           ? `Headless protect paused: ${state.overnightLossGuard.stopReason || "overnight loss-stop active"}`
-          : state.config.protect.enabled || state.config.protect.overnightEnabled
+          : hasAnyProtectEnabled()
           ? "Headless protect: no close or trailing actions"
           : "Headless protect idle";
       }
@@ -2120,7 +2678,7 @@ export const createHeadlessTrader = async (options) => {
 
   const refreshTimers = async () => {
     clearTimers();
-    if (state.config.auto.enabled) {
+    if (hasAnyAutoEnabled()) {
       const intervalMs =
         state.config.auto.timeframeOverride !== "PANEL"
           ? getWatchIntervalMs(state.config.auto.timeframeOverride)
@@ -2130,7 +2688,7 @@ export const createHeadlessTrader = async (options) => {
       }, intervalMs);
       void runAutoScan();
     }
-    if (state.config.protect.enabled || state.config.protect.overnightEnabled) {
+    if (hasAnyProtectEnabled()) {
       state.protectTimer = setInterval(() => {
         void runProtectLoop();
       }, 5000);
@@ -2141,8 +2699,8 @@ export const createHeadlessTrader = async (options) => {
   const getStatus = () => ({
     config: state.config,
     status: {
-      autoEnabled: state.config.auto.enabled,
-      protectEnabled: state.config.protect.enabled || state.config.protect.overnightEnabled,
+      autoEnabled: hasAnyAutoEnabled(),
+      protectEnabled: hasAnyProtectEnabled(),
       protectTrailingEnabled: state.config.protect.enabled,
       protectOvernightEnabled: state.config.protect.overnightEnabled,
       overnightLossStopActive: state.overnightLossGuard.active,
@@ -2167,9 +2725,12 @@ export const createHeadlessTrader = async (options) => {
   });
 
   const updateConfig = async (payload) => {
-    const previousAutoEnabled = state.config.auto.enabled;
-    const previousOvernightEnabled = state.config.protect.overnightEnabled;
-    const previousCommentTag = state.config.auto.commentTag;
+    const previousConfig = state.config;
+    const previousAutoEnabled = hasAnyAutoEnabled(previousConfig);
+    const previousOvernightEnabled = hasAnyProtectEnabled(previousConfig);
+    const previousPrefixes = JSON.stringify(
+      collectManagedTradeCommentPrefixes({ overnightOnly: true, config: previousConfig }).sort()
+    );
     state.config = sanitizeConfig(
       {
         ...state.config,
@@ -2179,15 +2740,18 @@ export const createHeadlessTrader = async (options) => {
       },
       runtimeDefaults
     );
+    const nextPrefixes = JSON.stringify(
+      collectManagedTradeCommentPrefixes({ overnightOnly: true, config: state.config }).sort()
+    );
     const reenabledAfterStop =
       state.overnightLossGuard.active &&
-      ((!previousAutoEnabled && state.config.auto.enabled) ||
-        (!previousOvernightEnabled && state.config.protect.overnightEnabled));
-    const commentTagChanged = previousCommentTag !== state.config.auto.commentTag;
+      ((!previousAutoEnabled && hasAnyAutoEnabled()) ||
+        (!previousOvernightEnabled && hasAnyProtectEnabled()) ||
+        previousPrefixes !== nextPrefixes);
     if (reenabledAfterStop) {
       await resetOvernightLossGuard({ markCurrentHistoryProcessed: true, resetLosses: true });
       pushLog("INFO", "Overnight loss-stop reset after manual re-enable");
-    } else if (commentTagChanged) {
+    } else if (previousPrefixes !== nextPrefixes) {
       await resetOvernightLossGuard({ markCurrentHistoryProcessed: true, resetLosses: true });
       await syncOvernightLossGuard();
     }

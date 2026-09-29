@@ -11,25 +11,27 @@
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "type-check": "tsc --noEmit",
     "market-bridge": "node mt5_bridge/server.mjs",
-    "mt5-bridge": "node mt5_bridge/server.mjs"
+    "mt5-bridge": "node mt5_bridge/server.mjs",
+    "test:mt5": "python -m unittest discover -s mt5_bridge -p \"test_*.py\""
   },
   "dependencies": {
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
+    "@supabase/supabase-js": "^2.38.0",
     "lightweight-charts": "^4.1.0",
-    "@supabase/supabase-js": "^2.38.0"
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
   },
   "devDependencies": {
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
+    "@typescript-eslint/eslint-plugin": "^6.5.0",
+    "@typescript-eslint/parser": "^6.5.0",
     "@vitejs/plugin-react": "^4.1.0",
-    "typescript": "^5.2.0",
-    "vite": "^4.4.0",
-    "tailwindcss": "^3.3.0",
-    "postcss": "^8.4.30",
     "autoprefixer": "^10.4.15",
     "eslint": "^8.48.0",
-    "@typescript-eslint/eslint-plugin": "^6.5.0",
-    "@typescript-eslint/parser": "^6.5.0"
+    "postcss": "^8.4.30",
+    "tailwindcss": "^3.3.0",
+    "terser": "^5.51.2",
+    "typescript": "^5.2.0",
+    "vite": "^4.4.0"
   }
 }

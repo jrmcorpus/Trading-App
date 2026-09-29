@@ -297,10 +297,10 @@ const Dashboard: React.FC<DashboardProps> = (props) => {
 interface TradingJournalProps {
   trades: Trade[];
   onAddTrade: (trade: Omit<Trade, 'id'>) => void; // Callback
-  currentBalance: number;
-}
+  currentBalance: number;![02](image.png)
+}0
 ```
-
+s
 **Rule**: Props flow down, callbacks flow up
 
 ---
@@ -309,7 +309,7 @@ interface TradingJournalProps {
 
 ### Core Dependencies (Minimal!)
 ```json
-{
+{ 
   "react": "^18.2.0",              // UI framework
   "react-dom": "^18.2.0",          // DOM rendering
   "lightweight-charts": "^4.1.0",  // Charts (when added)

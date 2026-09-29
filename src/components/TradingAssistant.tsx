@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Trading Assistant Component
  * AI-powered trading suggestions based on technical analysis
  * MT4-only signal generation from bridge candles
@@ -36,6 +36,14 @@ interface PriceData {
   movingAverage200Prev?: number;
   movingAverage200Slope?: number;
   movingAverage200SlopeAtrRatio?: number;
+  lastOpen: number;
+  lastHigh: number;
+  lastLow: number;
+  lastClose: number;
+  prevOpen: number;
+  prevHigh: number;
+  prevLow: number;
+  prevClose: number;
   lastCandleTime: number;
 }
 
@@ -66,6 +74,7 @@ type AutoStrategyMode = "CLASSIC_STACK" | "SCALP_M15";
 type AutoReentryMode = "OFF" | "BALANCED" | "STRICT";
 type AutoRuntimeMode = "BROWSER" | "HEADLESS";
 type AutoSideFilter = "BOTH" | "BUY_ONLY" | "SELL_ONLY";
+type ManagedSymbol = "GOLD" | "ETHUSD";
 type AutoTradeLogLevel = "INFO" | "WARN" | "ERROR";
 type WatchlistBoardAssetType = "CRYPTO" | "FOREX" | "METAL" | "INDEX";
 type WatchlistBoardTypeFilter = "ALL" | WatchlistBoardAssetType;
@@ -308,6 +317,34 @@ interface AutoOrderPlan {
   entryForRisk: number;
   label: string;
   fallbackReason?: string;
+  tpSource?: "STRUCTURE" | "RR";
+  rrAtTp?: number;
+}
+
+interface ManagedSymbolTradeDraft {
+  sideFilter: AutoSideFilter;
+  minConfidence: string;
+  minWinRate: string;
+  minRR: string;
+  maxSpreadPoints: string;
+  cooldownMin: string;
+  maxOpenTrades: string;
+  requireStrong: boolean;
+  enforceSymbolCooldown: boolean;
+  enforceDailyLossLimit: boolean;
+  enforceHardRiskBlock: boolean;
+  entryTimeframe: AutoEntryTiming;
+  entryMode: AutoEntryMode;
+  botLots: string;
+  riskMode: "PCT" | "USD";
+  useDynamicLot: boolean;
+  riskPct: string;
+  riskUsd: string;
+  riskGuardMult: string;
+  minSlPoints: string;
+  atrBufferMult: string;
+  minLot: string;
+  lotStep: string;
 }
 
 interface AutoOrderPlanResult {
@@ -494,29 +531,29 @@ const requestBridgeAiCompletion = async (
 
 const AUTO_TRADE_DEFAULTS = {
   sideFilter: "BOTH" as AutoSideFilter,
-  minConfidence: "70",
-  minWinRate: "65",
+  minConfidence: "30",
+  minWinRate: "0",
   minRR: "1.0",
   maxSpreadPoints: "80",
-  cooldownMin: "15",
+  cooldownMin: "60",
   maxOpenTrades: "2",
-  requireStrong: true,
-  enforceTrendStack: true,
+  requireStrong: false,
+  enforceTrendStack: false,
   enforceSymbolCooldown: true,
   enforceDailyLossLimit: true,
   enforceHardRiskBlock: true,
-  strategyMode: "CLASSIC_STACK" as AutoStrategyMode,
+  strategyMode: "SCALP_M15" as AutoStrategyMode,
   scalpAggressive: true,
   biasTimeframe: "H4" as ChartTimeframe,
   setupTimeframe: "H1" as ChartTimeframe,
   entryTimeframe: "M5" as AutoEntryTiming,
-  reentryMode: "BALANCED" as AutoReentryMode,
+  reentryMode: "OFF" as AutoReentryMode,
   timeframeOverride: "PANEL" as ChartTimeframe | "PANEL",
   entryMode: "MARKET" as AutoEntryMode,
-  allowMarketFallback: false,
-  fallbackMinConfidence: "70",
+  allowMarketFallback: true,
+  fallbackMinConfidence: "30",
   fallbackRrBuffer: "0.2",
-  botLots: "0.10",
+  botLots: "0.01",
   riskMode: "USD" as "PCT" | "USD",
   useDynamicLot: true,
   riskPct: "1.0",
@@ -524,7 +561,7 @@ const AUTO_TRADE_DEFAULTS = {
   riskGuardMult: "1.10",
   minSlPoints: "30",
   atrBufferMult: "0.25",
-  minLot: "0.10",
+  minLot: "0.01",
   lotStep: "0.01",
 };
 const HEADLESS_RUNTIME_STATUS_DEFAULT: HeadlessRuntimeStatus = {
@@ -551,12 +588,26 @@ const HEADLESS_RUNTIME_STATUS_DEFAULT: HeadlessRuntimeStatus = {
   auditLogs: [],
 };
 const AUTO_RISK_HARD_BLOCK_MULTIPLIER = 1.1;
-const HEADLESS_GOLD_PRESET_SYMBOL = "GOLD";
-const HEADLESS_GOLD_PRESET_TIMEFRAME: ChartTimeframe = "M5";
-const HEADLESS_GOLD_PRESET_COMMENT = "gold-overnight-scalp";
+const MANAGED_PROTECT_MAX_RISK_USD = 2;
+const AGGRESSIVE_AUTO_TP_TARGET_USD = 1;
+const HEADLESS_MANAGED_PRESET = [
+  {
+    symbol: "GOLD",
+    timeframe: "M5" as ChartTimeframe,
+    commentTag: "gold-overnight-scalp",
+    description: "GOLD M5 overnight scalp",
+  },
+  {
+    symbol: "ETHUSD",
+    timeframe: "M15" as ChartTimeframe,
+    commentTag: "eth-trend-pullback",
+    description: "ETHUSD M15 trend pullback",
+  },
+] as const;
+const MANAGED_SYMBOLS = ["GOLD", "ETHUSD"] as const;
 const HEADLESS_OVERNIGHT_BREAK_EVEN_PROFIT_USD = "0.30";
-const HEADLESS_OVERNIGHT_TARGET_PROFIT_USD = "1.50";
-const HEADLESS_OVERNIGHT_LOSS_USD = "1.50";
+const HEADLESS_OVERNIGHT_TARGET_PROFIT_USD = "1.10";
+const HEADLESS_OVERNIGHT_LOSS_USD = "1.20";
 const HEADLESS_BIAS_FLIP_TP_PROGRESS_PCT = "35";
 const HEADLESS_OVERNIGHT_RETRACE_ARM_USD = "0.80";
 const HEADLESS_OVERNIGHT_RETRACE_CLOSE_USD = "0.40";
@@ -681,7 +732,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   const [loading, setLoading] = useState(false);
   const [orderAction, setOrderAction] = useState<OrderAction>("PLACE");
   const [orderSide, setOrderSide] = useState<"BUY" | "SELL">("BUY");
-  const [orderLots, setOrderLots] = useState("0.10");
+  const [orderLots, setOrderLots] = useState("0.01");
   const [orderTicket, setOrderTicket] = useState("");
   const [orderCloseLots, setOrderCloseLots] = useState("");
   const [orderSL, setOrderSL] = useState("");
@@ -786,6 +837,59 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     atrBufferMult: AUTO_TRADE_DEFAULTS.atrBufferMult,
     minLot: AUTO_TRADE_DEFAULTS.minLot,
     lotStep: AUTO_TRADE_DEFAULTS.lotStep,
+  });
+  const [selectedManagedSymbol, setSelectedManagedSymbol] = useState<ManagedSymbol>("GOLD");
+  const [managedSymbolTradeDrafts, setManagedSymbolTradeDrafts] = useState<Record<ManagedSymbol, ManagedSymbolTradeDraft>>({
+    GOLD: {
+      sideFilter: AUTO_TRADE_DEFAULTS.sideFilter,
+      minConfidence: AUTO_TRADE_DEFAULTS.minConfidence,
+      minWinRate: AUTO_TRADE_DEFAULTS.minWinRate,
+      minRR: AUTO_TRADE_DEFAULTS.minRR,
+      maxSpreadPoints: AUTO_TRADE_DEFAULTS.maxSpreadPoints,
+      cooldownMin: AUTO_TRADE_DEFAULTS.cooldownMin,
+      maxOpenTrades: AUTO_TRADE_DEFAULTS.maxOpenTrades,
+      requireStrong: AUTO_TRADE_DEFAULTS.requireStrong,
+      enforceSymbolCooldown: AUTO_TRADE_DEFAULTS.enforceSymbolCooldown,
+      enforceDailyLossLimit: AUTO_TRADE_DEFAULTS.enforceDailyLossLimit,
+      enforceHardRiskBlock: AUTO_TRADE_DEFAULTS.enforceHardRiskBlock,
+      entryTimeframe: "M5",
+      entryMode: "MARKET",
+      botLots: AUTO_TRADE_DEFAULTS.botLots,
+      riskMode: AUTO_TRADE_DEFAULTS.riskMode,
+      useDynamicLot: AUTO_TRADE_DEFAULTS.useDynamicLot,
+      riskPct: AUTO_TRADE_DEFAULTS.riskPct,
+      riskUsd: AUTO_TRADE_DEFAULTS.riskUsd,
+      riskGuardMult: AUTO_TRADE_DEFAULTS.riskGuardMult,
+      minSlPoints: AUTO_TRADE_DEFAULTS.minSlPoints,
+      atrBufferMult: AUTO_TRADE_DEFAULTS.atrBufferMult,
+      minLot: AUTO_TRADE_DEFAULTS.minLot,
+      lotStep: AUTO_TRADE_DEFAULTS.lotStep,
+    },
+    ETHUSD: {
+      sideFilter: "BOTH",
+      minConfidence: "30",
+      minWinRate: "0",
+      minRR: "1.0",
+      maxSpreadPoints: "120",
+      cooldownMin: "45",
+      maxOpenTrades: "2",
+      requireStrong: false,
+      enforceSymbolCooldown: true,
+      enforceDailyLossLimit: AUTO_TRADE_DEFAULTS.enforceDailyLossLimit,
+      enforceHardRiskBlock: true,
+      entryTimeframe: "M15",
+      entryMode: "MARKET",
+      botLots: AUTO_TRADE_DEFAULTS.botLots,
+      riskMode: AUTO_TRADE_DEFAULTS.riskMode,
+      useDynamicLot: AUTO_TRADE_DEFAULTS.useDynamicLot,
+      riskPct: AUTO_TRADE_DEFAULTS.riskPct,
+      riskUsd: AUTO_TRADE_DEFAULTS.riskUsd,
+      riskGuardMult: AUTO_TRADE_DEFAULTS.riskGuardMult,
+      minSlPoints: "120",
+      atrBufferMult: "0.35",
+      minLot: AUTO_TRADE_DEFAULTS.minLot,
+      lotStep: AUTO_TRADE_DEFAULTS.lotStep,
+    },
   });
   const settingsWarnings = useMemo(() => {
     const warnings: string[] = [];
@@ -900,6 +1004,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
 
     return warnings;
   }, [autoTradeDraft]);
+  void settingsWarnings;
   const hasUnappliedTradeSettings = useMemo(() => {
     return JSON.stringify(autoTradeDraft) !== JSON.stringify({
       sideFilter: autoSideFilter,
@@ -992,7 +1097,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   const [protectBreakEvenEnabled, setProtectBreakEvenEnabled] = useState(true);
   const [protectBreakEvenR, setProtectBreakEvenR] = useState("1.0");
   const [protectBreakEvenProfitUsd, setProtectBreakEvenProfitUsd] = useState(HEADLESS_OVERNIGHT_BREAK_EVEN_PROFIT_USD);
-  const [protectDegradeCloseEnabled, setProtectDegradeCloseEnabled] = useState(true);
+  const [protectDegradeCloseEnabled, setProtectDegradeCloseEnabled] = useState(false);
   const [protectDegradeMinConfidence, setProtectDegradeMinConfidence] = useState("82");
   const [protectBiasFlipProfitLockEnabled, setProtectBiasFlipProfitLockEnabled] = useState(true);
   const [protectBiasFlipTpProgressPct, setProtectBiasFlipTpProgressPct] = useState(HEADLESS_BIAS_FLIP_TP_PROGRESS_PCT);
@@ -1003,7 +1108,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   const [protectOvernightProfitRetraceCloseUsd, setProtectOvernightProfitRetraceCloseUsd] = useState(
     HEADLESS_OVERNIGHT_RETRACE_CLOSE_USD
   );
-  const [protectOvernightEnabled, setProtectOvernightEnabled] = useState(true);
+  const [protectOvernightEnabled, setProtectOvernightEnabled] = useState(false);
   const [protectOvernightProfitUsd, setProtectOvernightProfitUsd] = useState(HEADLESS_OVERNIGHT_TARGET_PROFIT_USD);
   const [protectOvernightLossUsd, setProtectOvernightLossUsd] = useState(HEADLESS_OVERNIGHT_LOSS_USD);
   const [protectStatus, setProtectStatus] = useState("");
@@ -1112,6 +1217,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       }
     >
   >({});
+  const [livePanelQuotes, setLivePanelQuotes] = useState<
+    Record<string, { bid: number; ask: number; mid: number; time: number }>
+  >({});
   const [panelStrategyIndicators, setPanelStrategyIndicators] = useState<Record<string, PanelStrategyIndicators | null>>({});
   const [watchlistBoard, setWatchlistBoard] = useState<Record<string, WatchlistBoardEntry>>({});
   const [watchlistBoardLoading, setWatchlistBoardLoading] = useState(false);
@@ -1143,6 +1251,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     capabilities: [],
     checkedAtMs: Date.now(),
   });
+  const [headlessRuntimeConfig, setHeadlessRuntimeConfig] = useState<Record<string, unknown> | null>(null);
   const isHeadlessMode = autoRuntimeMode === "HEADLESS";
   const activeAutoTradeLogs = isHeadlessMode ? headlessRuntimeStatus.logs : autoTradeLogs;
   const activeBotExecutionAuditLogs = isHeadlessMode ? headlessRuntimeStatus.auditLogs : botExecutionAuditLogs;
@@ -1153,13 +1262,283 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     ? headlessRuntimeStatus.protectStatus || protectStatus
     : protectStatus;
 
+  const resolvePanelEntryMode = (symbol: string, timeframe: ChartTimeframe): AutoEntryMode => {
+    if (!isHeadlessMode) return autoEntryMode;
+    const config = headlessRuntimeConfig;
+    if (!config || typeof config !== "object") return autoEntryMode;
+
+    const watchlist = Array.isArray((config as { watchlist?: unknown }).watchlist)
+      ? ((config as { watchlist: Array<Record<string, unknown>> }).watchlist || [])
+      : [];
+    const isManagedPanel = watchlist.some(
+      (item) =>
+        normalizeSymbol(String(item.symbol || "")) === normalizeSymbol(symbol) &&
+        String(item.timeframe || "").toUpperCase() === timeframe
+    );
+    if (!isManagedPanel) return autoEntryMode;
+
+    const symbolProfiles = Array.isArray((config as { symbolProfiles?: unknown }).symbolProfiles)
+      ? ((config as { symbolProfiles: Array<Record<string, unknown>> }).symbolProfiles || [])
+      : [];
+    const symbolProfile = symbolProfiles.find(
+      (item) => normalizeSymbol(String(item.symbol || "")) === normalizeSymbol(symbol)
+    );
+    const profileEntryMode = String(
+      (symbolProfile?.auto as { entryMode?: unknown } | undefined)?.entryMode || ""
+    ).toUpperCase();
+    if (profileEntryMode === "LIMIT_SR" || profileEntryMode === "MARKET") {
+      return profileEntryMode as AutoEntryMode;
+    }
+
+    const baseEntryMode = String(
+      ((config as { auto?: { entryMode?: unknown } }).auto?.entryMode || "")
+    ).toUpperCase();
+    return baseEntryMode === "LIMIT_SR" ? "LIMIT_SR" : "MARKET";
+  };
+
+  const getManagedRuntimeProfile = (symbol: "GOLD" | "ETHUSD") => {
+    const normalizeManagedSymbol = (value: string): string => value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const config = headlessRuntimeConfig;
+    if (!config || typeof config !== "object") return null;
+    const symbolProfiles = Array.isArray((config as { symbolProfiles?: unknown }).symbolProfiles)
+      ? ((config as { symbolProfiles: Array<Record<string, unknown>> }).symbolProfiles || [])
+      : [];
+    const profile = symbolProfiles.find(
+      (item) => normalizeManagedSymbol(String(item.symbol || "")) === normalizeManagedSymbol(symbol)
+    );
+    if (!profile) return null;
+    return {
+      auto: typeof profile.auto === "object" && profile.auto ? (profile.auto as Record<string, unknown>) : null,
+      protect:
+        typeof profile.protect === "object" && profile.protect
+          ? (profile.protect as Record<string, unknown>)
+          : null,
+    };
+  };
+
+  const buildManagedSymbolTradeDraft = (
+    symbol: ManagedSymbol,
+    sourceConfig?: Record<string, unknown> | null
+  ): ManagedSymbolTradeDraft => {
+    const config =
+      sourceConfig && typeof sourceConfig === "object"
+        ? sourceConfig
+        : ({ symbolProfiles: [] } as Record<string, unknown>);
+    const symbolProfiles = Array.isArray((config as { symbolProfiles?: unknown }).symbolProfiles)
+      ? ((config as { symbolProfiles: Array<Record<string, unknown>> }).symbolProfiles || [])
+      : [];
+    const normalizeManagedSymbol = (value: string): string => value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const symbolProfile = symbolProfiles.find(
+      (item) => normalizeManagedSymbol(String(item.symbol || "")) === normalizeManagedSymbol(symbol)
+    );
+    const auto = typeof symbolProfile?.auto === "object" && symbolProfile.auto
+      ? (symbolProfile.auto as Record<string, unknown>)
+      : {};
+
+    return {
+      sideFilter: (String(auto.sideFilter || (symbol === "ETHUSD" ? "BOTH" : autoSideFilter)).toUpperCase() as AutoSideFilter),
+      minConfidence: String(auto.minConfidence ?? (symbol === "ETHUSD" ? 30 : autoMinConfidence)),
+      minWinRate: String(auto.minWinRate ?? (symbol === "ETHUSD" ? 0 : autoMinWinRate)),
+      minRR: String(auto.minRR ?? (symbol === "ETHUSD" ? 1.0 : autoMinRR)),
+      maxSpreadPoints: String(auto.maxSpreadPoints ?? (symbol === "ETHUSD" ? 120 : autoMaxSpreadPointsSetting)),
+      cooldownMin: String(auto.cooldownMin ?? (symbol === "ETHUSD" ? 45 : autoCooldownMin)),
+      maxOpenTrades: String(auto.maxOpenTrades ?? (symbol === "ETHUSD" ? 2 : sanitizeMaxOpenTrades(autoMaxOpenTrades, 1))),
+      requireStrong: Boolean(auto.requireStrong ?? (symbol === "ETHUSD" ? false : autoRequireStrongSignal)),
+      enforceSymbolCooldown: Boolean(auto.enforceSymbolCooldown ?? true),
+      enforceDailyLossLimit: Boolean(auto.enforceDailyLossLimit ?? autoEnforceDailyLossLimit),
+      enforceHardRiskBlock: Boolean(auto.enforceHardRiskBlock ?? (symbol === "ETHUSD" ? true : autoEnforceHardRiskBlock)),
+      entryTimeframe: (String(auto.entryTimeframe || (symbol === "ETHUSD" ? "M15" : "M5")).toUpperCase() as AutoEntryTiming),
+      entryMode: String(auto.entryMode || "LIMIT_SR").toUpperCase() === "MARKET" ? "MARKET" : "LIMIT_SR",
+      botLots: String(auto.botLots ?? autoBotLots),
+      riskMode: String(auto.riskMode || autoRiskMode).toUpperCase() === "PCT" ? "PCT" : "USD",
+      useDynamicLot: Boolean(auto.useDynamicLot ?? autoUseDynamicLot),
+      riskPct: String(auto.riskPct ?? autoRiskPct),
+      riskUsd: String(auto.riskUsd ?? autoRiskUsd),
+      riskGuardMult: String(auto.riskGuardMult ?? autoRiskGuardMult),
+      minSlPoints: String(auto.minSlPoints ?? (symbol === "ETHUSD" ? 120 : autoMinSlPoints)),
+      atrBufferMult: String(auto.atrBufferMult ?? (symbol === "ETHUSD" ? 0.35 : autoAtrBufferMult)),
+      minLot: String(auto.minLot ?? autoDynamicMinLot),
+      lotStep: String(auto.lotStep ?? autoDynamicLotStep),
+    };
+  };
+
+  const selectedManagedSymbolTradeDraft = managedSymbolTradeDrafts[selectedManagedSymbol];
+  const appliedSelectedManagedSymbolTradeDraft = useMemo(
+    () => buildManagedSymbolTradeDraft(selectedManagedSymbol, headlessRuntimeConfig),
+    [
+      selectedManagedSymbol,
+      headlessRuntimeConfig,
+      autoSideFilter,
+      autoMinConfidence,
+      autoMinWinRate,
+      autoMinRR,
+      autoMaxSpreadPointsSetting,
+      autoCooldownMin,
+      autoMaxOpenTrades,
+      autoRequireStrongSignal,
+      autoEnforceDailyLossLimit,
+      autoEnforceHardRiskBlock,
+      autoBotLots,
+      autoRiskMode,
+      autoUseDynamicLot,
+      autoRiskPct,
+      autoRiskUsd,
+      autoRiskGuardMult,
+      autoMinSlPoints,
+      autoAtrBufferMult,
+      autoDynamicMinLot,
+      autoDynamicLotStep,
+    ]
+  );
+  const updateSelectedManagedSymbolTradeDraft = (
+    updater: ManagedSymbolTradeDraft | ((prev: ManagedSymbolTradeDraft) => ManagedSymbolTradeDraft)
+  ) => {
+    setManagedSymbolTradeDrafts((prev) => ({
+      ...prev,
+      [selectedManagedSymbol]:
+        typeof updater === "function"
+          ? (updater as (prev: ManagedSymbolTradeDraft) => ManagedSymbolTradeDraft)(prev[selectedManagedSymbol])
+          : updater,
+    }));
+  };
+  const selectedManagedSymbolWarnings = useMemo(() => {
+    const warnings: string[] = [];
+    const minConfidence = Number(selectedManagedSymbolTradeDraft.minConfidence);
+    const minWinRate = Number(selectedManagedSymbolTradeDraft.minWinRate);
+    const minRR = Number(selectedManagedSymbolTradeDraft.minRR);
+    const maxSpreadPoints = Number(selectedManagedSymbolTradeDraft.maxSpreadPoints);
+    const cooldownMin = Number(selectedManagedSymbolTradeDraft.cooldownMin);
+    const maxOpenTrades = Number(selectedManagedSymbolTradeDraft.maxOpenTrades);
+    const botLots = Number(selectedManagedSymbolTradeDraft.botLots);
+    const riskPct = Number(selectedManagedSymbolTradeDraft.riskPct);
+    const riskUsd = Number(selectedManagedSymbolTradeDraft.riskUsd);
+    const minLot = Number(selectedManagedSymbolTradeDraft.minLot);
+    const lotStep = Number(selectedManagedSymbolTradeDraft.lotStep);
+    const minSlPoints = Number(selectedManagedSymbolTradeDraft.minSlPoints);
+    const atrBufferMult = Number(selectedManagedSymbolTradeDraft.atrBufferMult);
+
+    if (!Number.isFinite(minConfidence) || minConfidence < 0 || minConfidence > 100) warnings.push("Min Confidence % must be between 0 and 100.");
+    if (!Number.isFinite(minWinRate) || minWinRate < 0 || minWinRate > 100) warnings.push("Min Win Rate % must be between 0 and 100.");
+    if (!Number.isFinite(minRR) || minRR < 1) warnings.push("Min R:R must be at least 1.0.");
+    if (!Number.isFinite(maxSpreadPoints) || maxSpreadPoints <= 0) warnings.push("Max Spread Points must be greater than 0.");
+    if (!Number.isFinite(cooldownMin) || cooldownMin < 1) warnings.push("Cooldown must be at least 1 minute.");
+    if (!Number.isFinite(maxOpenTrades) || maxOpenTrades < 1) warnings.push("Max Active Trades must be at least 1.");
+    if (!Number.isFinite(botLots) || botLots <= 0) warnings.push("Default Bot Lots must be greater than 0.");
+    if (selectedManagedSymbolTradeDraft.riskMode === "PCT" && (!Number.isFinite(riskPct) || riskPct <= 0)) warnings.push("Risk Per Trade % must be greater than 0.");
+    if (selectedManagedSymbolTradeDraft.riskMode === "USD" && (!Number.isFinite(riskUsd) || riskUsd <= 0)) warnings.push("Risk Per Trade USD must be greater than 0.");
+    if (!Number.isFinite(minLot) || minLot <= 0) warnings.push("Min Lot must be greater than 0.");
+    if (!Number.isFinite(lotStep) || lotStep <= 0) warnings.push("Lot Step must be greater than 0.");
+    if (!Number.isFinite(minSlPoints) || minSlPoints <= 0) warnings.push("Min Stop Points must be greater than 0.");
+    if (!Number.isFinite(atrBufferMult) || atrBufferMult < 0) warnings.push("ATR Buffer must be >= 0.");
+
+    return warnings;
+  }, [selectedManagedSymbolTradeDraft]);
+  const hasSelectedManagedSymbolUnappliedChanges = useMemo(
+    () => JSON.stringify(selectedManagedSymbolTradeDraft) !== JSON.stringify(appliedSelectedManagedSymbolTradeDraft),
+    [selectedManagedSymbolTradeDraft, appliedSelectedManagedSymbolTradeDraft]
+  );
+
+  const managedSetupCards = (["GOLD", "ETHUSD"] as const).map((symbol) => {
+    const runtimeProfile = getManagedRuntimeProfile(symbol);
+    const autoProfile = runtimeProfile?.auto;
+    const protectProfile = runtimeProfile?.protect;
+    const isGold = symbol === "GOLD";
+    const timeframe = isGold ? "M5" : "M15";
+    const sideFilterRaw = String(
+      autoProfile?.sideFilter || (isGold ? autoTradeDraft.sideFilter : "BOTH")
+    ).toUpperCase();
+    const sideFilterLabel =
+      sideFilterRaw === "BUY_ONLY" ? "Buy only" : sideFilterRaw === "SELL_ONLY" ? "Sell only" : "Both sides";
+    const minConfidence = Number(
+      autoProfile?.minConfidence ?? (isGold ? autoTradeDraft.minConfidence : 30)
+    );
+    const minWinRate = Number(
+      autoProfile?.minWinRate ?? (isGold ? autoTradeDraft.minWinRate : 0)
+    );
+    const minRR = Number(autoProfile?.minRR ?? (isGold ? autoTradeDraft.minRR : 1.0));
+    const cooldownMin = Number(
+      autoProfile?.cooldownMin ?? (isGold ? autoTradeDraft.cooldownMin : 45)
+    );
+    const maxSpreadPoints = Number(
+      autoProfile?.maxSpreadPoints ?? (isGold ? autoTradeDraft.maxSpreadPoints : 120)
+    );
+    const requireStrong = Boolean(
+      autoProfile?.requireStrong ?? (isGold ? autoTradeDraft.requireStrong : false)
+    );
+    const entryMode = String(autoProfile?.entryMode || "LIMIT_SR").toUpperCase() === "MARKET" ? "MARKET" : "LIMIT_SR";
+    const minSlPoints = Number(
+      autoProfile?.minSlPoints ?? (isGold ? autoTradeDraft.minSlPoints : 120)
+    );
+    const atrBufferMult = Number(
+      autoProfile?.atrBufferMult ?? (isGold ? autoTradeDraft.atrBufferMult : 0.35)
+    );
+    const hardRiskBlock = Boolean(
+      autoProfile?.enforceHardRiskBlock ?? (isGold ? autoTradeDraft.enforceHardRiskBlock : true)
+    );
+    const symbolCooldown = Boolean(
+      autoProfile?.enforceSymbolCooldown ?? (isGold ? autoTradeDraft.enforceSymbolCooldown : true)
+    );
+    const overnightEnabled = Boolean(protectProfile?.overnightEnabled ?? (isGold ? protectOvernightEnabled : false));
+    const breakEvenEnabled = Boolean(protectProfile?.breakEvenEnabled ?? protectBreakEvenEnabled);
+    const breakEvenProfitUsd = Number(protectProfile?.breakEvenProfitUsd ?? protectBreakEvenProfitUsd);
+    const degradeCloseEnabled = Boolean(protectProfile?.degradeCloseEnabled ?? protectDegradeCloseEnabled);
+    const newsFilterEnabled = Boolean(autoProfile?.highImpactNewsFilterEnabled ?? isGold);
+    const ma200FlatEnabled = Boolean(autoProfile?.ma200FlatFilterEnabled ?? isGold);
+    const biasPath = isGold ? "H4 -> H1 -> M5" : "H4 -> H1 -> M15";
+    const title = isGold ? "GOLD M5" : "ETHUSD M15";
+    const description = isGold ? "Overnight metal pullback" : "Crypto trend pullback";
+    const accent = isGold
+      ? {
+          border: "border-amber-500/40",
+          bg: "bg-amber-500/10",
+          title: "text-amber-200",
+          text: "text-amber-100",
+          pill: "border-amber-400/40 bg-amber-400/10 text-amber-100",
+        }
+      : {
+          border: "border-cyan-500/40",
+          bg: "bg-cyan-500/10",
+          title: "text-cyan-200",
+          text: "text-cyan-100",
+          pill: "border-cyan-400/40 bg-cyan-400/10 text-cyan-100",
+        };
+
+    return {
+      symbol,
+      title,
+      description,
+      timeframe,
+      sideFilterLabel,
+      minConfidence,
+      minWinRate,
+      minRR,
+      cooldownMin,
+      maxSpreadPoints,
+      requireStrong,
+      entryMode,
+      minSlPoints,
+      atrBufferMult,
+      hardRiskBlock,
+      symbolCooldown,
+      overnightEnabled,
+      breakEvenEnabled,
+      breakEvenProfitUsd,
+      degradeCloseEnabled,
+      newsFilterEnabled,
+      ma200FlatEnabled,
+      biasPath,
+      accent,
+      notes: isGold
+        ? "Uses stricter metal filters, news blackout, and overnight profit/loss protection."
+        : "Uses looser ETH thresholds, both-side trading, and no overnight auto-close profile.",
+    };
+  });
+
   const buildHeadlessConfigPayload = () => ({
-    watchlist: [
-      {
-        symbol: HEADLESS_GOLD_PRESET_SYMBOL,
-        timeframe: HEADLESS_GOLD_PRESET_TIMEFRAME,
-      },
-    ],
+    watchlist: HEADLESS_MANAGED_PRESET.map((item) => ({
+      symbol: item.symbol,
+      timeframe: item.timeframe,
+    })),
     auto: {
       enabled: autoTradeEnabled,
       sideFilter: autoSideFilter,
@@ -1168,7 +1547,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       minRR: Number(autoMinRR),
       maxSpreadPoints: Number(autoMaxSpreadPointsSetting),
       cooldownMin: effectiveCooldownMin,
-      maxOpenTrades: effectiveMaxOpenTrades,
+      maxOpenTrades: Math.max(2, effectiveMaxOpenTrades),
       requireStrong: autoRequireStrongSignal,
       enforceTrendStack: autoEnforceTrendStack,
       enforceSymbolCooldown: autoEnforceSymbolCooldown,
@@ -1204,8 +1583,143 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       adaptiveLearningEnabled,
       learnedBlockedSymbols,
       learnedBlockedSessions,
-      commentTag: HEADLESS_GOLD_PRESET_COMMENT,
+      commentTag: "managed-dual-core",
     },
+    symbolProfiles: [
+      {
+        symbol: "GOLD",
+        auto: {
+          enabled: autoTradeEnabled,
+          sideFilter: autoSideFilter,
+          minConfidence: Number(autoMinConfidence),
+          minWinRate: Number(autoMinWinRate),
+          minRR: Number(autoMinRR),
+          maxSpreadPoints: Number(autoMaxSpreadPointsSetting),
+          cooldownMin: effectiveCooldownMin,
+          maxOpenTrades: Math.max(2, effectiveMaxOpenTrades),
+          requireStrong: autoRequireStrongSignal,
+          enforceTrendStack: autoEnforceTrendStack,
+          enforceSymbolCooldown: autoEnforceSymbolCooldown,
+          enforceDailyLossLimit: autoEnforceDailyLossLimit,
+          enforceHardRiskBlock: autoEnforceHardRiskBlock,
+          strategyMode: autoStrategyMode,
+          scalpAggressive: autoScalpAggressive,
+          sessionGateEnabled: autoSessionGateEnabled,
+          entryTimeframe: "M5",
+          timeframeOverride: "PANEL",
+          entryMode: autoEntryMode,
+          allowMarketFallback: autoAllowMarketFallback,
+          fallbackMinConfidence: Number(autoFallbackMinConfidence),
+          fallbackRrBuffer: Number(autoFallbackRrBuffer),
+          botLots: Number(autoBotLots),
+          riskMode: autoRiskMode,
+          useDynamicLot: autoUseDynamicLot,
+          riskPct: Number(autoRiskPct),
+          riskUsd: Number(autoRiskUsd),
+          riskGuardMult: Number(autoRiskGuardMult),
+          minSlPoints: Number(autoMinSlPoints),
+          atrBufferMult: Number(autoAtrBufferMult),
+          minLot: Number(autoDynamicMinLot),
+          lotStep: Number(autoDynamicLotStep),
+          ma200FlatFilterEnabled: true,
+          ma200FlatMaxAtrRatio: HEADLESS_MA200_FLAT_MAX_ATR_RATIO,
+          highImpactNewsFilterEnabled: true,
+          highImpactNewsLookbackMin: HEADLESS_HIGH_IMPACT_NEWS_LOOKBACK_MIN,
+          highImpactNewsKeywords: HEADLESS_HIGH_IMPACT_NEWS_KEYWORDS,
+          adaptiveLearningEnabled,
+          learnedBlockedSymbols,
+          learnedBlockedSessions,
+          commentTag: "gold-overnight-scalp",
+        },
+        protect: {
+          enabled: protectEnabled,
+          timeframe: protectTimeframe,
+          atrPeriod: Number(protectAtrPeriod),
+          atrMult: Number(protectAtrMult),
+          lookback: Number(protectLookback),
+          minStopPoints: Number(protectMinStopPoints),
+          graceMin: Number(protectGraceMin),
+          breakEvenEnabled: protectBreakEvenEnabled,
+          breakEvenR: Number(protectBreakEvenR),
+          breakEvenProfitUsd: Number(protectBreakEvenProfitUsd),
+          degradeCloseEnabled: protectDegradeCloseEnabled,
+          degradeMinConfidence: Number(protectDegradeMinConfidence),
+          biasFlipProfitLockEnabled: protectBiasFlipProfitLockEnabled,
+          biasFlipTpProgressPct: Number(protectBiasFlipTpProgressPct),
+          overnightProfitRetraceLockEnabled: protectOvernightProfitRetraceLockEnabled,
+          overnightProfitRetraceArmUsd: Number(protectOvernightProfitRetraceArmUsd),
+          overnightProfitRetraceCloseUsd: Number(protectOvernightProfitRetraceCloseUsd),
+          overnightEnabled: protectOvernightEnabled,
+          overnightProfitUsd: Number(protectOvernightProfitUsd),
+          overnightLossUsd: Number(protectOvernightLossUsd),
+        },
+      },
+      {
+        symbol: "ETHUSD",
+        auto: {
+          enabled: autoTradeEnabled,
+          sideFilter: "BOTH",
+          minConfidence: 30,
+          minWinRate: 0,
+          minRR: 1.0,
+          maxSpreadPoints: 120,
+          cooldownMin: 45,
+          maxOpenTrades: 2,
+          requireStrong: false,
+          enforceTrendStack: autoEnforceTrendStack,
+          enforceSymbolCooldown: true,
+          enforceDailyLossLimit: autoEnforceDailyLossLimit,
+          enforceHardRiskBlock: true,
+          strategyMode: autoStrategyMode,
+          scalpAggressive: autoScalpAggressive,
+          sessionGateEnabled: autoSessionGateEnabled,
+          entryTimeframe: "M15",
+          timeframeOverride: "PANEL",
+          entryMode: "MARKET",
+          allowMarketFallback: true,
+          fallbackMinConfidence: 30,
+          fallbackRrBuffer: 0.3,
+          botLots: Number(autoBotLots),
+          riskMode: autoRiskMode,
+          useDynamicLot: autoUseDynamicLot,
+          riskPct: Number(autoRiskPct),
+          riskUsd: Number(autoRiskUsd),
+          riskGuardMult: Number(autoRiskGuardMult),
+          minSlPoints: 120,
+          atrBufferMult: 0.35,
+          minLot: Number(autoDynamicMinLot),
+          lotStep: Number(autoDynamicLotStep),
+          ma200FlatFilterEnabled: false,
+          highImpactNewsFilterEnabled: false,
+          adaptiveLearningEnabled: false,
+          learnedBlockedSymbols: [],
+          learnedBlockedSessions: [],
+          commentTag: "eth-trend-pullback",
+        },
+        protect: {
+          enabled: protectEnabled,
+          timeframe: "M15",
+          atrPeriod: Number(protectAtrPeriod),
+          atrMult: Number(protectAtrMult),
+          lookback: Number(protectLookback),
+          minStopPoints: Number(protectMinStopPoints),
+          graceMin: Number(protectGraceMin),
+          breakEvenEnabled: protectBreakEvenEnabled,
+          breakEvenR: Number(protectBreakEvenR),
+          breakEvenProfitUsd: Number(protectBreakEvenProfitUsd),
+          degradeCloseEnabled: protectDegradeCloseEnabled,
+          degradeMinConfidence: Number(protectDegradeMinConfidence),
+          biasFlipProfitLockEnabled: protectBiasFlipProfitLockEnabled,
+          biasFlipTpProgressPct: Number(protectBiasFlipTpProgressPct),
+          overnightProfitRetraceLockEnabled: false,
+          overnightProfitRetraceArmUsd: Number(protectOvernightProfitRetraceArmUsd),
+          overnightProfitRetraceCloseUsd: Number(protectOvernightProfitRetraceCloseUsd),
+          overnightEnabled: false,
+          overnightProfitUsd: Number(protectOvernightProfitUsd),
+          overnightLossUsd: Number(protectOvernightLossUsd),
+        },
+      },
+    ],
     protect: {
       enabled: protectEnabled,
       timeframe: protectTimeframe,
@@ -1235,6 +1749,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       const response = await fetch(`${mt4BridgeBase}/headless/status`, { method: "GET" });
       const data = await readResponseJsonSafe(response);
       if (!response.ok || !data?.ok || !data?.status) return;
+      if (data.config && typeof data.config === "object") {
+        setHeadlessRuntimeConfig(data.config as Record<string, unknown>);
+      }
       setHeadlessRuntimeStatus({
         autoEnabled: Boolean(data.status.autoEnabled),
         protectEnabled: Boolean(data.status.protectEnabled),
@@ -1276,6 +1793,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       const data = await readResponseJsonSafe(response);
       if (!response.ok || !data?.ok || !data?.status) {
         throw new Error(String(data?.error || "Headless config sync failed"));
+      }
+      if (data.config && typeof data.config === "object") {
+        setHeadlessRuntimeConfig(data.config as Record<string, unknown>);
       }
       setHeadlessRuntimeStatus({
         autoEnabled: Boolean(data.status.autoEnabled),
@@ -1323,6 +1843,63 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       // fall back to the current UI payload when the bridge is unavailable
     }
     return buildHeadlessConfigPayload() as unknown as Record<string, unknown>;
+  };
+
+  const applySelectedManagedSymbolSettings = async () => {
+    const draft = managedSymbolTradeDrafts[selectedManagedSymbol];
+    const warnings = selectedManagedSymbolWarnings;
+    if (warnings.length > 0) {
+      setAutoTradeStatus(`${selectedManagedSymbol} settings need attention before sync.`);
+      return;
+    }
+    const payload = JSON.parse(JSON.stringify(headlessRuntimeConfig ?? buildHeadlessConfigPayload())) as {
+      symbolProfiles?: Array<Record<string, unknown>>;
+      [key: string]: unknown;
+    };
+    const symbolProfiles = Array.isArray(payload.symbolProfiles) ? payload.symbolProfiles : [];
+    const targetIndex = symbolProfiles.findIndex(
+      (item) => normalizeSymbol(String(item.symbol || "")) === normalizeSymbol(selectedManagedSymbol)
+    );
+    if (targetIndex < 0) {
+      setAutoTradeStatus(`Unable to find ${selectedManagedSymbol} profile in headless config.`);
+      return;
+    }
+
+    const currentProfile = symbolProfiles[targetIndex];
+    symbolProfiles[targetIndex] = {
+      ...currentProfile,
+      auto: {
+        ...(currentProfile.auto || {}),
+        sideFilter: draft.sideFilter,
+        minConfidence: Number(draft.minConfidence),
+        minWinRate: Number(draft.minWinRate),
+        minRR: Number(draft.minRR),
+        maxSpreadPoints: Number(draft.maxSpreadPoints),
+        cooldownMin: Number(draft.cooldownMin),
+        maxOpenTrades: Number(draft.maxOpenTrades),
+        requireStrong: draft.requireStrong,
+        enforceSymbolCooldown: draft.enforceSymbolCooldown,
+        enforceDailyLossLimit: draft.enforceDailyLossLimit,
+        enforceHardRiskBlock: draft.enforceHardRiskBlock,
+        entryTimeframe: draft.entryTimeframe,
+        entryMode: draft.entryMode,
+        botLots: Number(draft.botLots),
+        riskMode: draft.riskMode,
+        useDynamicLot: draft.useDynamicLot,
+        riskPct: Number(draft.riskPct),
+        riskUsd: Number(draft.riskUsd),
+        riskGuardMult: Number(draft.riskGuardMult),
+        minSlPoints: Number(draft.minSlPoints),
+        atrBufferMult: Number(draft.atrBufferMult),
+        minLot: Number(draft.minLot),
+        lotStep: Number(draft.lotStep),
+      },
+    };
+    payload.symbolProfiles = symbolProfiles;
+
+    const result = await syncHeadlessConfig(payload as ReturnType<typeof buildHeadlessConfigPayload>);
+    if (!result.ok) return;
+    setAutoTradeStatus(`${selectedManagedSymbol} trading settings saved and applied.`);
   };
 
   const exportSettingsBundle = async () => {
@@ -1541,11 +2118,54 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     const sec = diffSec % 60;
     return `${min}m ${sec}s ago`;
   };
-  const mt4SymbolSuffix = (import.meta.env.VITE_MT4_SYMBOL_SUFFIX as string | undefined) || "";
-  const mt4CryptoSuffix =
-    (import.meta.env.VITE_MT4_CRYPTO_SUFFIX as string | undefined) ||
-    (mt4SymbolSuffix === "m#" ? "#" : mt4SymbolSuffix);
-  const profileSymbolSuffix = accountProfile === "MICRO" ? "m#" : "#";
+  const formatSetupPrice = (symbol: string, value?: number | null): string => {
+    if (typeof value !== "number" || !Number.isFinite(value)) return "--";
+    return value.toFixed(isCryptoSymbol(symbol) ? 2 : 5);
+  };
+  const getSetupBiasTone = (signal: "BUY" | "SELL" | "HOLD" | null | undefined): string => {
+    switch (signal) {
+      case "BUY":
+        return "text-emerald-200";
+      case "SELL":
+        return "text-rose-200";
+      default:
+        return "text-slate-200";
+    }
+  };
+  const getSetupBadgeClass = (signal: "BUY" | "SELL" | "HOLD" | null | undefined): string => {
+    switch (signal) {
+      case "BUY":
+        return "border-emerald-400/40 bg-emerald-400/10 text-emerald-200";
+      case "SELL":
+        return "border-rose-400/40 bg-rose-400/10 text-rose-200";
+      default:
+        return "border-slate-600/70 bg-slate-800/80 text-slate-200";
+    }
+  };
+  const getSetupCardClass = (signal: "BUY" | "SELL" | "HOLD" | null | undefined): string => {
+    switch (signal) {
+      case "BUY":
+        return "border-emerald-500/35 bg-[linear-gradient(135deg,rgba(5,46,22,0.92),rgba(15,23,42,0.92))]";
+      case "SELL":
+        return "border-rose-500/35 bg-[linear-gradient(135deg,rgba(69,10,10,0.92),rgba(15,23,42,0.92))]";
+      default:
+        return "border-slate-700/70 bg-[linear-gradient(135deg,rgba(15,23,42,0.95),rgba(30,41,59,0.88))]";
+    }
+  };
+  const stripLegacyBrokerSuffix = (value: string): string =>
+    String(value || "")
+      .trim()
+      .replace(/micro(?=#|$)/gi, "")
+      .replace(/m(?=#|$)/gi, "");
+  const normalizeBrokerSuffix = (value: string): string => {
+    const suffix = String(value || "").trim();
+    if (/^(?:micro|m)#?$/i.test(suffix)) return suffix.endsWith("#") ? "#" : "";
+    return suffix;
+  };
+  const mt4SymbolSuffix = normalizeBrokerSuffix((import.meta.env.VITE_MT4_SYMBOL_SUFFIX as string | undefined) || "");
+  const configuredCryptoSuffix = (import.meta.env.VITE_MT4_CRYPTO_SUFFIX as string | undefined) || "";
+  const mt4CryptoSuffix = normalizeBrokerSuffix(configuredCryptoSuffix || mt4SymbolSuffix) || "#";
+  const profileSymbolSuffix = "#";
   const profileCryptoSuffix = "#";
   const mt4SymbolMapRaw = (import.meta.env.VITE_MT4_SYMBOL_MAP as string | undefined) || "";
   const mt4SymbolMap = useMemo(() => {
@@ -1669,8 +2289,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   };
 
   const fetchMt4Tick = async (symbol: string) => {
+    const resolvedSymbol = resolveOrderSymbol(symbol);
     try {
-      const response = await fetch(`${mt4BridgeBase}/ticks?symbol=${encodeURIComponent(symbol)}`, { method: "GET" });
+      const response = await fetch(`${mt4BridgeBase}/ticks?symbol=${encodeURIComponent(resolvedSymbol)}`, { method: "GET" });
       if (!response.ok) return null;
       const data = await response.json();
       if (!data?.ok || !data?.tick) return null;
@@ -1704,16 +2325,22 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   };
 
   const normalizeSymbol = (value: string): string => value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const symbolsMatch = (left: string, right: string): boolean => {
+    const leftKey = normalizeSymbol(left);
+    const rightKey = normalizeSymbol(right);
+    if (!leftKey || !rightKey) return false;
+    return leftKey === rightKey || leftKey.startsWith(rightKey) || rightKey.startsWith(leftKey);
+  };
   const resolveOrderSymbol = (symbol: string): string => {
     const normalized = normalizeSymbol(symbol);
     const mapped = mt4SymbolMap[normalized];
-    if (mapped) return mapped;
+    if (mapped) return stripLegacyBrokerSuffix(mapped);
     if (normalized !== symbol.toUpperCase()) return symbol;
     const suffix = isCryptoSymbol(symbol)
       ? (mt4CryptoSuffix || profileCryptoSuffix || "#")
       : (mt4SymbolSuffix || profileSymbolSuffix || "#");
     if (!suffix) return normalized;
-    return `${normalized}${suffix}`;
+    return stripLegacyBrokerSuffix(`${normalized}${suffix}`);
   };
   const getSymbolExecutionPreset = (symbol: string): SymbolExecutionPreset => {
     const normalized = normalizeSymbol(symbol);
@@ -1849,7 +2476,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         const suffix = isCryptoSymbol(symbol)
           ? (mt4CryptoSuffix || profileCryptoSuffix || "#")
           : (mt4SymbolSuffix || profileSymbolSuffix || "#");
-        const resolved = mapped || `${normalized}${suffix || ""}`;
+        const resolved = mapped
+          ? stripLegacyBrokerSuffix(mapped)
+          : stripLegacyBrokerSuffix(`${normalized}${suffix || ""}`);
         if (!isAllowlisted(resolved)) {
           addWarning(
             `Allowed-symbol mismatch: ${symbol} resolves to ${resolved}, but it is missing in VITE_MT4_ALLOWED_SYMBOLS.`
@@ -2035,6 +2664,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       alertMessage: "Optimized gold overnight preset applied.",
     });
   };
+  void loadRecommendedTradingConfig;
 
   const applyAdaptiveRecommendations = () => {
     const nextMinConfidence = String(adaptiveLearningReport.recommendations.minConfidence.suggested);
@@ -2153,6 +2783,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   };
 
   const fetchMt4Candles = async (symbol: string, timeframe: ChartTimeframe, count = 260): Promise<Mt4Candle[]> => {
+    const resolvedSymbol = resolveOrderSymbol(symbol);
     const parseCandles = (items: any[]): Mt4Candle[] =>
       items
         .map((item: any) => ({
@@ -2174,7 +2805,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         .sort((a: Mt4Candle, b: Mt4Candle) => a.time - b.time);
 
     const response = await fetch(
-      `${mt4BridgeBase}/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}&count=${count}`,
+      `${mt4BridgeBase}/candles?symbol=${encodeURIComponent(resolvedSymbol)}&timeframe=${timeframe}&count=${count}`,
       { method: "GET" }
     );
     if (!response.ok) return [];
@@ -2189,9 +2820,10 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     count = 260
   ): Promise<Mt4Candle[]> => {
     if (ASSISTANT_MT4_ONLY_MODE) return [];
+    const resolvedSymbol = resolveOrderSymbol(symbol);
     try {
       const response = await fetch(
-        `${mt4BridgeBase}/fallback-candles?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}&count=${count}`,
+        `${mt4BridgeBase}/fallback-candles?symbol=${encodeURIComponent(resolvedSymbol)}&timeframe=${timeframe}&count=${count}`,
         { method: "GET" }
       );
       if (!response.ok) return [];
@@ -2279,7 +2911,99 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       movingAverage200Prev: previousMa200,
       movingAverage200Slope: ma200Slope,
       movingAverage200SlopeAtrRatio: ma200SlopeAtrRatio,
+      lastOpen: last.open,
+      lastHigh: last.high,
+      lastLow: last.low,
+      lastClose: last.close,
+      prevOpen: prev.open,
+      prevHigh: prev.high,
+      prevLow: prev.low,
+      prevClose: prev.close,
       lastCandleTime: last.time,
+    };
+  };
+
+  const getDirectionalStructureTarget = (
+    side: "BUY" | "SELL",
+    data: PriceData,
+    entryPrice: number,
+    point: number
+  ): number | null => {
+    const rawTarget =
+      side === "BUY"
+        ? Math.max(Number(data.resistanceLevel), Number(data.swingHigh))
+        : Math.min(Number(data.supportLevel), Number(data.swingLow));
+    if (!Number.isFinite(rawTarget) || rawTarget <= 0) return null;
+    if (side === "BUY" && !(rawTarget > entryPrice + point)) return null;
+    if (side === "SELL" && !(rawTarget < entryPrice - point)) return null;
+    return rawTarget;
+  };
+
+  const evaluateDirectionalConfirmation = (
+    symbol: string,
+    data: PriceData,
+    side: "BUY" | "SELL"
+  ): {
+    nearStructure: boolean;
+    zoneDistance: number;
+    zoneBuffer: number;
+    zoneAtrRatio: number;
+    maOk: boolean;
+    rsiOk: boolean;
+    patternOk: boolean;
+    patternLabel: string;
+  } => {
+    const point = getPointSizeForSymbol(symbol, data.current);
+    const atrValue =
+      Number.isFinite(data.atr) && data.atr > 0
+        ? data.atr
+        : Math.max(Math.abs(data.high - data.low) / 14, point * 20);
+    const structureLevel =
+      side === "BUY" ? Math.min(Number(data.supportLevel), Number(data.swingLow)) : Math.max(Number(data.resistanceLevel), Number(data.swingHigh));
+    const zoneDistance = Math.abs(Number(data.current) - structureLevel);
+    const zoneBuffer = Math.max(point * Math.max(6, getMinSlPointsForSymbol(symbol) * 0.5), atrValue * 0.35);
+    const maOk = side === "BUY" ? data.current >= data.movingAverage50 : data.current <= data.movingAverage50;
+    const rsi = Number(data.rsi || 0);
+    const rsiOk = side === "BUY" ? rsi >= 35 && rsi <= 60 : rsi >= 40 && rsi <= 65;
+
+    const candleBody = Math.max(Math.abs(data.lastClose - data.lastOpen), point);
+    const upperWick = Math.max(0, data.lastHigh - Math.max(data.lastOpen, data.lastClose));
+    const lowerWick = Math.max(0, Math.min(data.lastOpen, data.lastClose) - data.lastLow);
+    const bullishEngulfing =
+      data.lastClose > data.lastOpen &&
+      data.prevClose < data.prevOpen &&
+      data.lastOpen <= data.prevClose &&
+      data.lastClose >= data.prevOpen;
+    const bearishEngulfing =
+      data.lastClose < data.lastOpen &&
+      data.prevClose > data.prevOpen &&
+      data.lastOpen >= data.prevClose &&
+      data.lastClose <= data.prevOpen;
+    const bullishRejection = data.lastClose > data.lastOpen && lowerWick >= candleBody * 1.5 && upperWick <= candleBody * 0.8;
+    const bearishRejection = data.lastClose < data.lastOpen && upperWick >= candleBody * 1.5 && lowerWick <= candleBody * 0.8;
+    const patternOk = side === "BUY" ? bullishEngulfing || bullishRejection : bearishEngulfing || bearishRejection;
+    const patternLabel =
+      side === "BUY"
+        ? bullishEngulfing
+          ? "bullish engulfing"
+          : bullishRejection
+          ? "bullish rejection"
+          : "no bullish rejection/engulfing"
+        : bearishEngulfing
+        ? "bearish engulfing"
+        : bearishRejection
+        ? "bearish rejection"
+        : "no bearish rejection/engulfing";
+
+    return {
+      nearStructure: zoneDistance <= zoneBuffer,
+      zoneDistance,
+      zoneBuffer,
+      zoneAtrRatio: atrValue > 0 ? zoneDistance / atrValue : Number.NaN,
+      maOk,
+      rsiOk,
+      patternOk,
+      patternLabel,
     };
   };
 
@@ -2287,6 +3011,182 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   const generatePriceData = async (symbol: string, timeframe: ChartTimeframe): Promise<PriceData | null> => {
     const candles = await fetchMt4Candles(symbol, timeframe, 320);
     return buildPriceDataFromCandles(symbol, candles);
+  };
+
+  const getManagedProtectProfile = (
+    symbol: string
+  ): { managedSymbol: ManagedSymbol; timeframe: ChartTimeframe; tradeDraft: ManagedSymbolTradeDraft } | null => {
+    const preset = HEADLESS_MANAGED_PRESET.find((item) => symbolsMatch(item.symbol, symbol));
+    if (!preset) return null;
+    return {
+      managedSymbol: preset.symbol,
+      timeframe: preset.timeframe,
+      tradeDraft: managedSymbolTradeDrafts[preset.symbol],
+    };
+  };
+
+  const buildMissingProtectionPlan = async (
+    position: OpenPosition,
+    side: "BUY" | "SELL",
+    tick: { bid: number; ask: number; mid: number; time: number } | null
+  ): Promise<
+    | {
+        managedSymbol: ManagedSymbol;
+        timeframe: ChartTimeframe;
+        sl: number;
+        tp: number;
+        rr: number;
+        tpSource: "STRUCTURE" | "RR";
+      }
+    | null
+  > => {
+    const missingSl = !(Number(position.sl) > 0);
+    const missingTp = !(Number(position.tp) > 0);
+    if (!missingSl && !missingTp) return null;
+
+    const managedProfile = getManagedProtectProfile(position.symbol);
+    if (!managedProfile) return null;
+
+    const entry = Number(position.openPrice);
+    if (!Number.isFinite(entry) || entry <= 0) return null;
+
+    const getManagedProtectionRiskDistanceCap = async (symbol: string, lots: number, maxRiskUsd: number) => {
+      if (!(Number.isFinite(lots) && lots > 0 && Number.isFinite(maxRiskUsd) && maxRiskUsd > 0)) {
+        return Number.NaN;
+      }
+      try {
+        const specResponse = await fetch(`${mt4BridgeBase}/symbols?symbol=${encodeURIComponent(symbol)}`, { method: "GET" });
+        const specData = await readResponseJsonSafe(specResponse);
+        const spec = specResponse.ok && specData?.ok && specData?.spec ? specData.spec : null;
+        const tickValue = Number(spec?.tickValue || 0);
+        const tickSize = Number(spec?.tickSize || 0);
+        const point = Number(spec?.point || 0);
+        const lotSize = Number(spec?.lotSize || 0);
+        let moneyPerPricePerLot = 0;
+        if (Number.isFinite(tickValue) && tickValue > 0 && Number.isFinite(tickSize) && tickSize > 0) {
+          moneyPerPricePerLot = tickValue / tickSize;
+        } else if (Number.isFinite(tickValue) && tickValue > 0 && Number.isFinite(point) && point > 0) {
+          moneyPerPricePerLot = tickValue / point;
+        } else if (Number.isFinite(lotSize) && lotSize > 0) {
+          moneyPerPricePerLot = lotSize;
+        }
+        return moneyPerPricePerLot > 0 ? maxRiskUsd / (moneyPerPricePerLot * lots) : Number.NaN;
+      } catch {
+        return Number.NaN;
+      }
+    };
+
+    const data = await generatePriceData(managedProfile.managedSymbol, managedProfile.timeframe);
+    if (!data) return null;
+
+    const current = Number(tick?.mid ?? data.current);
+    const point = getPointSizeForSymbol(position.symbol, current || entry);
+    const atrValue =
+      Number.isFinite(data.atr) && data.atr > 0
+        ? data.atr
+        : Math.max(Math.abs(data.high - data.low) / 14, point * 20);
+    const minSlPoints = Math.max(1, Number(managedProfile.tradeDraft.minSlPoints) || getMinSlPointsForSymbol(position.symbol));
+    const atrBufferMult = Math.max(0, Number(managedProfile.tradeDraft.atrBufferMult) || 0.25);
+    const minRR = Math.max(0.5, Number(managedProfile.tradeDraft.minRR) || 1.0);
+    const minStopDistance = Math.max(point * minSlPoints, atrValue * 0.35);
+    const structureBuffer = Math.max(point * 3, atrValue * atrBufferMult);
+    const structureLevel =
+      side === "BUY"
+        ? Math.min(Number(data.supportLevel), Number(data.swingLow))
+        : Math.max(Number(data.resistanceLevel), Number(data.swingHigh));
+
+    let computedSl = Number(position.sl);
+    if (missingSl) {
+      if (!Number.isFinite(structureLevel) || structureLevel <= 0) return null;
+      computedSl =
+        side === "BUY"
+          ? Math.min(
+              structureLevel - structureBuffer,
+              entry - point,
+              current - minStopDistance
+            )
+          : Math.max(
+              structureLevel + structureBuffer,
+              entry + point,
+              current + minStopDistance
+            );
+
+      const lots = Number(position.lots);
+      const maxRiskDistance = await getManagedProtectionRiskDistanceCap(
+        position.symbol,
+        lots,
+        MANAGED_PROTECT_MAX_RISK_USD
+      );
+      if (Number.isFinite(maxRiskDistance) && maxRiskDistance > point) {
+        const cappedSl = side === "BUY" ? entry - maxRiskDistance : entry + maxRiskDistance;
+        computedSl = side === "BUY" ? Math.max(computedSl, cappedSl) : Math.min(computedSl, cappedSl);
+      }
+    }
+
+    if (!Number.isFinite(computedSl) || computedSl <= 0) return null;
+    if (missingSl) {
+      if (side === "BUY" && !(computedSl < entry - point)) return null;
+      if (side === "SELL" && !(computedSl > entry + point)) return null;
+      if (tick && side === "BUY" && !(computedSl < tick.bid - point)) return null;
+      if (tick && side === "SELL" && !(computedSl > tick.ask + point)) return null;
+    }
+
+    const rawRiskDistance = side === "BUY" ? entry - computedSl : computedSl - entry;
+    const riskDistance =
+      Number.isFinite(rawRiskDistance) && rawRiskDistance > point
+        ? rawRiskDistance
+        : minStopDistance;
+    if (!Number.isFinite(riskDistance) || riskDistance <= point) return null;
+
+    const existingTp = Number(position.tp);
+    let finalTp = existingTp;
+    let tpSource: "STRUCTURE" | "RR" = "RR";
+    if (missingTp) {
+      const structureTarget = getDirectionalStructureTarget(side, data, entry, point);
+      const structureTargetValue = Number(structureTarget);
+      const structureTpOk =
+        Number.isFinite(structureTargetValue) &&
+        ((side === "BUY" && structureTargetValue > Math.max(entry + point, current + point)) ||
+          (side === "SELL" && structureTargetValue < Math.min(entry - point, current - point)));
+      const rrTarget = side === "BUY" ? entry + riskDistance * minRR : entry - riskDistance * minRR;
+      const fallbackTp =
+        side === "BUY"
+          ? Math.max(rrTarget, current + point)
+          : Math.min(rrTarget, current - point);
+      const structureRewardDistance = side === "BUY" ? structureTargetValue - entry : entry - structureTargetValue;
+      const structureRr =
+        structureTpOk && Number.isFinite(structureRewardDistance) && structureRewardDistance > point
+          ? structureRewardDistance / riskDistance
+          : Number.NaN;
+      if (structureTpOk && Number.isFinite(structureRr) && structureRr >= minRR) {
+        finalTp = structureTargetValue;
+        tpSource = "STRUCTURE";
+      } else {
+        finalTp = fallbackTp;
+      }
+    }
+
+    if (!Number.isFinite(finalTp) || finalTp <= 0) return null;
+    if (side === "BUY" && !(finalTp > entry + point)) return null;
+    if (side === "SELL" && !(finalTp < entry - point)) return null;
+    if (tick && side === "BUY" && !(finalTp > tick.ask + point)) return null;
+    if (tick && side === "SELL" && !(finalTp < tick.bid - point)) return null;
+
+    const rewardDistance = side === "BUY" ? finalTp - entry : entry - finalTp;
+    const rr =
+      Number.isFinite(rewardDistance) && rewardDistance > point
+        ? rewardDistance / riskDistance
+        : Number.NaN;
+    if (!Number.isFinite(rr) || rr <= 0) return null;
+
+    return {
+      managedSymbol: managedProfile.managedSymbol,
+      timeframe: managedProfile.timeframe,
+      sl: computedSl,
+      tp: finalTp,
+      rr,
+      tpSource,
+    };
   };
 
   const evaluateCooldownReentryConfirmation = async (
@@ -2441,6 +3341,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
   };
 
   const buildSignalNoiseProfile = (data: PriceData) => {
+    const cryptoProfile = isCryptoSymbol(data.symbol);
     const point = getPointSizeForSymbol(data.symbol, data.current);
     const atrValue =
       Number.isFinite(data.atr) && data.atr > 0
@@ -2470,12 +3371,18 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
 
     const noiseScore = clampNumber(score, 0, 100);
     const noiseState: TradeSignal["noiseState"] = noiseScore >= 55 ? "HIGH" : noiseScore >= 30 ? "MEDIUM" : "LOW";
+    const confidencePenaltyMult = noiseState === "HIGH"
+      ? cryptoProfile ? 0.30 : 0.45
+      : cryptoProfile ? 0.20 : 0.30;
+    const winRatePenaltyMult = noiseState === "HIGH"
+      ? cryptoProfile ? 0.20 : 0.28
+      : cryptoProfile ? 0.14 : 0.20;
 
     return {
       noiseScore,
       noiseState,
-      confidencePenalty: noiseState === "HIGH" ? Math.round(noiseScore * 0.45) : Math.round(noiseScore * 0.3),
-      winRatePenalty: noiseState === "HIGH" ? Math.round(noiseScore * 0.28) : Math.round(noiseScore * 0.2),
+      confidencePenalty: Math.round(noiseScore * confidencePenaltyMult),
+      winRatePenalty: Math.round(noiseScore * winRatePenaltyMult),
     };
   };
 
@@ -2521,46 +3428,76 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     let signal: "BUY" | "SELL" | "HOLD" = "HOLD";
     let strength: "STRONG" | "MODERATE" | "WEAK" = "WEAK";
     let confidence = 0;
+    let buyScore = 0;
+    let sellScore = 0;
 
-    // RSI Analysis
-    if (data.rsi < 30) {
-      signal = "BUY";
-      confidence += 25;
-    } else if (data.rsi > 70) {
-      signal = "SELL";
-      confidence += 25;
-    }
+    // Score direction per indicator instead of adding confidence to a pre-picked side.
+    if (data.rsi < 30) buyScore += 25;
+    else if (data.rsi < 40) buyScore += 15;
+    else if (data.rsi < 46) buyScore += 8;
+    else if (data.rsi > 70) sellScore += 25;
+    else if (data.rsi > 60) sellScore += 15;
+    else if (data.rsi > 54) sellScore += 8;
 
-    // Moving Average Analysis
     if (data.current > data.movingAverage50 && data.movingAverage50 > data.movingAverage200) {
-      if (signal !== "SELL") signal = "BUY";
-      confidence += 25;
-    } else if (data.current < data.movingAverage50 && data.movingAverage50 < data.movingAverage200) {
-      if (signal !== "BUY") signal = "SELL";
-      confidence += 25;
+      buyScore += 25;
+    } else if (data.current > data.movingAverage50 && data.movingAverage50 >= data.movingAverage200) {
+      buyScore += 16;
+    } else if (data.current > data.movingAverage50) {
+      buyScore += 8;
     }
 
-    // MACD Analysis
-    if (data.macd.line > data.macd.signal && data.macd.histogram > 0) {
-      if (signal !== "SELL") signal = "BUY";
-      confidence += 25;
-    } else if (data.macd.line < data.macd.signal && data.macd.histogram < 0) {
-      if (signal !== "BUY") signal = "SELL";
-      confidence += 25;
+    if (data.current < data.movingAverage50 && data.movingAverage50 < data.movingAverage200) {
+      sellScore += 25;
+    } else if (data.current < data.movingAverage50 && data.movingAverage50 <= data.movingAverage200) {
+      sellScore += 16;
+    } else if (data.current < data.movingAverage50) {
+      sellScore += 8;
     }
+
+    if (data.macd.line > data.macd.signal && data.macd.histogram > 0) {
+      buyScore += 25;
+    } else if (data.macd.line > data.macd.signal) {
+      buyScore += 16;
+    } else if (data.macd.histogram > 0) {
+      buyScore += 8;
+    }
+
+    if (data.macd.line < data.macd.signal && data.macd.histogram < 0) {
+      sellScore += 25;
+    } else if (data.macd.line < data.macd.signal) {
+      sellScore += 16;
+    } else if (data.macd.histogram < 0) {
+      sellScore += 8;
+    }
+
+    const dominantScore = Math.max(buyScore, sellScore);
+    const opposingScore = Math.min(buyScore, sellScore);
+    const directionalEdge = Math.abs(buyScore - sellScore);
+
+    if (buyScore >= sellScore + 8 && buyScore >= 28) signal = "BUY";
+    else if (sellScore >= buyScore + 8 && sellScore >= 28) signal = "SELL";
+
+    confidence = Math.max(0, dominantScore - Math.round(opposingScore * 0.35));
 
     const noiseProfile = buildSignalNoiseProfile(data);
     if (signal !== "HOLD") {
       confidence = Math.max(0, confidence - noiseProfile.confidencePenalty);
-      if (noiseProfile.noiseState === "HIGH" && confidence < 55) {
+      const minHoldConfidence = isCryptoSymbol(data.symbol) ? 45 : 55;
+      if (noiseProfile.noiseState === "HIGH" && confidence < minHoldConfidence) {
         signal = "HOLD";
       }
     }
 
+    if (signal !== "HOLD" && directionalEdge < 8) {
+      signal = "HOLD";
+      confidence = Math.max(0, confidence - 6);
+    }
+
     // Determine strength
     if (signal === "HOLD") strength = "WEAK";
-    else if (confidence > 60) strength = "STRONG";
-    else if (confidence > 35) strength = "MODERATE";
+    else if (confidence >= 65) strength = "STRONG";
+    else if (confidence >= 40) strength = "MODERATE";
     else strength = "WEAK";
 
     // Calculate win rate
@@ -2595,12 +3532,17 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
 
     const riskDistance = Math.max(Math.abs(entryPrimary - stopLoss), minStopDistance);
     const targetRR = strength === "STRONG" ? 2.2 : strength === "MODERATE" ? 2.0 : 1.8;
-    const takeProfit =
+    const structureTarget =
+      signal === "BUY" || signal === "SELL"
+        ? getDirectionalStructureTarget(signal, data, entryPrimary, point)
+        : null;
+    const rrTargetPrice =
       signal === "BUY"
         ? entryPrimary + riskDistance * targetRR
         : signal === "SELL"
         ? entryPrimary - riskDistance * targetRR
         : entryPrimary + riskDistance;
+    const takeProfit = structureTarget ?? rrTargetPrice;
 
     const isCrypto = isCryptoSymbol(data.symbol);
 
@@ -2656,8 +3598,23 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         if (side === "BUY" && !(sl < pendingPrice - point)) sl = pendingPrice - minStopDistance;
         if (side === "SELL" && !(sl > pendingPrice + point)) sl = pendingPrice + minStopDistance;
 
-        const riskDistance = Math.max(Math.abs(pendingPrice - sl), minStopDistance);
-        const tp = side === "BUY" ? pendingPrice + riskDistance * rrTarget : pendingPrice - riskDistance * rrTarget;
+        const structureTarget = getDirectionalStructureTarget(side, data, pendingPrice, point);
+        if (!structureTarget) {
+          return {
+            plan: null,
+            blockedReason: "Structure TP unavailable beyond the pending entry; move already extended past the next zone",
+          };
+        }
+        const structureRr = computeEffectiveRR(side, pendingPrice, sl, structureTarget);
+        if (!Number.isFinite(structureRr)) {
+          return { plan: null, blockedReason: "Structure TP R:R unavailable" };
+        }
+        if (structureRr < rrTarget) {
+          return {
+            plan: null,
+            blockedReason: `Structure TP R:R ${structureRr.toFixed(2)} < ${rrTarget.toFixed(2)}`,
+          };
+        }
         return {
           plan: {
             action: "PENDING",
@@ -2665,15 +3622,20 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
             orderType: side === "BUY" ? "BUY_LIMIT" : "SELL_LIMIT",
             price: pendingPrice,
             sl,
-            tp,
+            tp: structureTarget,
             entryForRisk: pendingPrice,
             label: `${side} LIMIT @ S/R`,
+            tpSource: "STRUCTURE",
+            rrAtTp: structureRr,
           },
         };
       }
 
       if (!autoAllowMarketFallback) {
-        return { plan: null, blockedReason: "Limit @ S/R invalid and market fallback is disabled" };
+        return {
+          plan: null,
+          blockedReason: "Limit @ S/R invalid and market fallback is disabled",
+        };
       }
 
       const marketEntry =
@@ -2704,9 +3666,10 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       }
 
       const fallbackRiskDistance = Math.max(slDistance, minStopDistance);
-      const marketTp = side === "BUY"
+      const structureTarget = getDirectionalStructureTarget(side, data, marketEntry, point);
+      const marketTp = structureTarget ?? (side === "BUY"
         ? marketEntry + fallbackRiskDistance * rrTarget
-        : marketEntry - fallbackRiskDistance * rrTarget;
+        : marketEntry - fallbackRiskDistance * rrTarget);
       const marketRr = computeEffectiveRR(side, marketEntry, marketSl, marketTp);
       if (signal.confidence < fallbackMinConfidence) {
         return {
@@ -2736,6 +3699,8 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
           entryForRisk: marketEntry,
           label: `${side} MARKET`,
           fallbackReason: "Fallback to MARKET: invalid limit-at-structure",
+          tpSource: structureTarget ? "STRUCTURE" : "RR",
+          rrAtTp: marketRr,
         },
       };
     }
@@ -2762,6 +3727,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         : marketEntry - fallbackRiskDistance * rrTarget;
       reframedStops = true;
     }
+    const finalMarketRr = computeEffectiveRR(side, marketEntry, marketSl, marketTp);
 
     return {
       plan: {
@@ -2772,6 +3738,8 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         entryForRisk: marketEntry,
         label: `${side} MARKET`,
         fallbackReason: reframedStops ? "SL/TP auto-reframed from live entry (stale signal levels)" : undefined,
+        tpSource: "RR",
+        rrAtTp: finalMarketRr,
       },
     };
   };
@@ -2784,7 +3752,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     try {
       const data = await generatePriceData(selectedSymbol, selectedTimeframe);
       if (!data) {
-        setTradeBridgeMessage(`No MT4 candle data available for ${selectedSymbol} ${selectedTimeframe}.`);
+        setTradeBridgeMessage(`No MT5 candle data available for ${selectedSymbol} ${selectedTimeframe}.`);
         setTradeSignal(null);
         return;
       }
@@ -2838,7 +3806,10 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       const parsed = JSON.parse(raw);
       if (parsed?.orderAction) setOrderAction(parsed.orderAction);
       if (parsed?.orderSide) setOrderSide(parsed.orderSide);
-      if (parsed?.orderLots !== undefined) setOrderLots(String(parsed.orderLots));
+      if (parsed?.orderLots !== undefined) {
+        const storedOrderLots = Number(parsed.orderLots);
+        setOrderLots(storedOrderLots === 0.1 ? "0.01" : String(parsed.orderLots));
+      }
       if (parsed?.orderTicket !== undefined) setOrderTicket(String(parsed.orderTicket));
       if (parsed?.orderCloseLots !== undefined) setOrderCloseLots(String(parsed.orderCloseLots));
       if (parsed?.orderSL !== undefined) setOrderSL(String(parsed.orderSL));
@@ -2906,7 +3877,10 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         if (typeof parsed?.allowMarketFallback === "boolean") setAutoAllowMarketFallback(parsed.allowMarketFallback);
         if (parsed?.fallbackMinConfidence !== undefined) setAutoFallbackMinConfidence(String(parsed.fallbackMinConfidence));
         if (parsed?.fallbackRrBuffer !== undefined) setAutoFallbackRrBuffer(String(parsed.fallbackRrBuffer));
-        if (parsed?.botLots !== undefined) setAutoBotLots(String(parsed.botLots));
+        if (parsed?.botLots !== undefined) {
+          const storedBotLots = Number(parsed.botLots);
+          setAutoBotLots(storedBotLots === 0.1 ? AUTO_TRADE_DEFAULTS.botLots : String(parsed.botLots));
+        }
         if (parsed?.riskMode === "USD" || parsed?.riskMode === "PCT") setAutoRiskMode(parsed.riskMode);
         if (typeof parsed?.useDynamicLot === "boolean") setAutoUseDynamicLot(parsed.useDynamicLot);
         if (parsed?.riskPct !== undefined) setAutoRiskPct(String(parsed.riskPct));
@@ -2916,7 +3890,8 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         if (parsed?.atrBufferMult !== undefined) setAutoAtrBufferMult(sanitizePositiveNumber(parsed.atrBufferMult, 0.25, 0, 10));
         if (parsed?.minLot !== undefined) {
           hasStoredMinLot = true;
-          setAutoDynamicMinLot(String(parsed.minLot));
+          const storedMinLot = Number(parsed.minLot);
+          setAutoDynamicMinLot(storedMinLot === 0.1 ? AUTO_TRADE_DEFAULTS.minLot : String(parsed.minLot));
         }
         if (parsed?.lotStep !== undefined) {
           hasStoredLotStep = true;
@@ -2924,6 +3899,33 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         }
         if (Array.isArray(parsed?.logs)) setAutoTradeLogs(parsed.logs);
         if (Array.isArray(parsed?.auditLogs)) setBotExecutionAuditLogs(parsed.auditLogs);
+
+        const parsedMinConfidence = Number(parsed?.minConfidence);
+        const parsedMinWinRate = Number(parsed?.minWinRate);
+        const parsedMinRR = Number(parsed?.minRR);
+        const parsedEntryMode = String(parsed?.entryMode || "");
+        const parsedFallbackMinConfidence = Number(parsed?.fallbackMinConfidence);
+        const shouldMigrateAggressivePreset =
+          parsedEntryMode !== "MARKET" ||
+          !Number.isFinite(parsedMinConfidence) ||
+          parsedMinConfidence > 30 ||
+          !Number.isFinite(parsedMinWinRate) ||
+          parsedMinWinRate > 0 ||
+          !Number.isFinite(parsedMinRR) ||
+          parsedMinRR > 1;
+        if (shouldMigrateAggressivePreset) {
+          setAutoMinConfidence("30");
+          setAutoMinWinRate("0");
+          setAutoMinRR("1.0");
+          setAutoEntryMode("MARKET");
+          setAutoAllowMarketFallback(true);
+          setAutoFallbackMinConfidence(
+            Number.isFinite(parsedFallbackMinConfidence) && parsedFallbackMinConfidence > 0
+              ? String(Math.min(parsedFallbackMinConfidence, 30))
+              : "30"
+          );
+          setAutoRequireStrongSignal(false);
+        }
       } catch {
         // ignore invalid cache
       }
@@ -3077,6 +4079,14 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     const maxIndex = Math.max(0, panelSymbols.length - 1);
     if (riskPreviewPanelIndex > maxIndex) setRiskPreviewPanelIndex(maxIndex);
   }, [panelSymbols, riskPreviewPanelIndex]);
+
+  useEffect(() => {
+    if (!showTradeSettings) return;
+    setManagedSymbolTradeDrafts({
+      GOLD: buildManagedSymbolTradeDraft("GOLD", headlessRuntimeConfig),
+      ETHUSD: buildManagedSymbolTradeDraft("ETHUSD", headlessRuntimeConfig),
+    });
+  }, [showTradeSettings, headlessRuntimeConfig]);
 
   useEffect(() => {
     if (!showTradeSettings) return;
@@ -3381,6 +4391,37 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
 
   useEffect(() => {
     let cancelled = false;
+    const refreshLivePanelQuotes = async () => {
+      if (document.hidden) return;
+      const symbols = Array.from(new Set(panelSymbols.filter(Boolean)));
+      const quotes = await Promise.all(
+        symbols.map(async (symbol) => {
+          const tick = await fetchMt4Tick(symbol);
+          return tick ? ([symbol, tick] as const) : null;
+        })
+      );
+      if (cancelled) return;
+      setLivePanelQuotes((previous) => {
+        const next = { ...previous };
+        quotes.forEach((entry) => {
+          if (entry) next[entry[0]] = entry[1];
+        });
+        return next;
+      });
+    };
+
+    void refreshLivePanelQuotes();
+    const intervalId = window.setInterval(() => {
+      void refreshLivePanelQuotes();
+    }, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [panelSymbols, mt4BridgeBase, mt4SymbolMapRaw, mt4SymbolSuffix, mt4CryptoSuffix]);
+
+  useEffect(() => {
+    let cancelled = false;
     const calculateRiskSettingsPreview = async () => {
       const previewTimeframeOverride = autoTradeDraft.timeframeOverride;
       const previewBotLots = Math.max(0, Number(autoTradeDraft.botLots) || 0);
@@ -3636,7 +4677,8 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     if (signal.signal !== "BUY" && signal.signal !== "SELL") return false;
     const strengthPass = autoRequireStrongSignal ? signal.strength === "STRONG" : signal.strength !== "WEAK";
     const confidencePass = signal.confidence >= Math.max(0, Number(autoMinConfidence) || 0);
-    const winRatePass = signal.winRate >= Math.max(0, Number(autoMinWinRate) || 0);
+    const configuredMinWinRate = Math.max(0, Number(autoMinWinRate) || 0);
+    const winRatePass = configuredMinWinRate <= 0 || signal.winRate >= configuredMinWinRate;
     return strengthPass && confidencePass && winRatePass;
   };
 
@@ -4049,6 +5091,29 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
               failures.push(`${symbol}: ${closeAction.reason || "overnight retrace close failed"}`);
             }
           }
+        }
+
+        const missingProtectionPlan = await buildMissingProtectionPlan(position, side, tick);
+        if (missingProtectionPlan) {
+          const missingLabel =
+            !(Number(position.sl) > 0) && !(Number(position.tp) > 0)
+              ? "SL/TP"
+              : !(Number(position.sl) > 0)
+              ? "SL"
+              : "TP";
+          const autofillAction = await executeAction({
+            action: "MODIFY",
+            ticket: position.ticket,
+            sl: missingProtectionPlan.sl,
+            tp: missingProtectionPlan.tp,
+          });
+          if (autofillAction.ok) {
+            updates.push(
+              `${symbol} #${position.ticket} auto-filled ${missingLabel} via ${missingProtectionPlan.managedSymbol} ${missingProtectionPlan.timeframe} (${missingProtectionPlan.tpSource.toLowerCase()} TP, R:R ${missingProtectionPlan.rr.toFixed(2)})`
+            );
+            continue;
+          }
+          failures.push(`${symbol}: ${autofillAction.reason || "missing SL/TP autofill failed"}`);
         }
 
         if (breakEvenEnabled && tick && Number.isFinite(tick.mid)) {
@@ -4684,7 +5749,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       };
 
       const prompt = [
-        "You are a professional market scanner and risk manager for MT4 execution.",
+        "You are a professional market scanner and risk manager for MT5 execution.",
         "Goal: rank the best watchlist symbols for today using BOTH price action and external market news.",
         "You must be conservative and reject weak/conflicting setups. Never promise profit.",
         "Use only the provided marketIntel links as external references (do not fabricate links).",
@@ -4832,8 +5897,10 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
           ),
           createPolicyCheck(
             "auto_win_rate",
-            signal.winRate >= minWinRate,
-            signal.winRate >= minWinRate
+            minWinRate <= 0 || signal.winRate >= minWinRate,
+            minWinRate <= 0
+              ? "Win-rate gate inactive"
+              : signal.winRate >= minWinRate
               ? `${signal.winRate.toFixed(0)}% >= ${minWinRate}%`
               : `Win rate ${signal.winRate.toFixed(0)}% < ${minWinRate}%`
           ),
@@ -4881,6 +5948,33 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         ],
         checkedAtMs: nowMs,
       });
+    }
+
+    if (strategyMode === "CLASSIC_STACK") {
+      const biasCacheKey = `${symbol}|${AUTO_BIAS_TIMEFRAME}`;
+      let biasSignal = trendSignalCache[biasCacheKey];
+      if (biasSignal === undefined) {
+        const biasData = await generatePriceData(symbol, AUTO_BIAS_TIMEFRAME);
+        biasSignal = biasData ? generateTradeSignal(biasData) : null;
+        trendSignalCache[biasCacheKey] = biasSignal;
+      }
+      const h4Bias = biasSignal?.signal === "BUY" || biasSignal?.signal === "SELL" ? biasSignal.signal : null;
+      if (h4Bias && signal.signal !== h4Bias) {
+        return finalizeEvaluation({
+          symbol,
+          panelTimeframe,
+          autoTimeframe,
+          eligible: false,
+          reason: `${AUTO_BIAS_TIMEFRAME} bias is ${h4Bias}; wait for ${h4Bias} entry confirmation`,
+          pass: null,
+          message: `Bias-led mode blocked: ${AUTO_BIAS_TIMEFRAME} ${h4Bias} overrides ${autoTimeframe} ${signal.signal}`,
+          checks: [
+            createPolicyCheck("auto_h4_bias", false, `${AUTO_BIAS_TIMEFRAME} bias ${h4Bias} opposes ${autoTimeframe} ${signal.signal}`),
+            createPolicyCheck("signal", false, `${autoTimeframe} signal ${signal.signal} is counter-trend to ${AUTO_BIAS_TIMEFRAME} ${h4Bias}`),
+          ],
+          checkedAtMs: nowMs,
+        });
+      }
     }
 
     const resolvedSymbol = resolveOrderSymbol(symbol);
@@ -4955,9 +6049,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     );
     addLocalCheck(
       "auto_win_rate",
-      signal.winRate >= minWinRate,
-      `${signal.winRate.toFixed(0)}% >= ${minWinRate}%`,
-      `Win rate ${signal.winRate.toFixed(0)}% < ${minWinRate}%`
+      minWinRate <= 0 || signal.winRate >= minWinRate,
+      minWinRate <= 0 ? "Win-rate gate inactive" : `${signal.winRate.toFixed(0)}% >= ${minWinRate}%`,
+      minWinRate <= 0 ? "Win-rate gate inactive" : `Win rate ${signal.winRate.toFixed(0)}% < ${minWinRate}%`
     );
     addLocalCheck(
       "auto_noise",
@@ -5040,6 +6134,35 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       "No existing open position on symbol",
       "Existing open position on symbol"
     );
+
+    if (strategyMode === "CLASSIC_STACK") {
+      const confirmation = evaluateDirectionalConfirmation(symbol, dataForOrder, orderPlan.side);
+      const structureHint = orderPlan.side === "BUY" ? "support" : "resistance";
+      addLocalCheck(
+        "auto_sr_zone",
+        confirmation.nearStructure,
+        `${autoTimeframe} price is inside the ${structureHint} zone`,
+        `Price is not yet at the ${structureHint} zone on ${autoTimeframe} (${confirmation.zoneAtrRatio.toFixed(2)} ATR away)`
+      );
+      addLocalCheck(
+        "auto_ma50_bias",
+        confirmation.maOk,
+        `${autoTimeframe} price is aligned with MA50 for ${orderPlan.side}`,
+        `${autoTimeframe} MA50 filter blocks ${orderPlan.side}`
+      );
+      addLocalCheck(
+        "auto_sr_rsi",
+        confirmation.rsiOk,
+        `${autoTimeframe} RSI supports ${orderPlan.side}`,
+        `${autoTimeframe} RSI is not supportive for ${orderPlan.side} (${Number(dataForOrder.rsi).toFixed(1)})`
+      );
+      addLocalCheck(
+        "auto_candle_confirm",
+        confirmation.patternOk,
+        `${autoTimeframe} ${confirmation.patternLabel} confirms ${orderPlan.side}`,
+        `Need ${orderPlan.side === "BUY" ? "bullish" : "bearish"} rejection or engulfing candle on ${autoTimeframe}`
+      );
+    }
 
     // Strategy filter: either classic multi-timeframe stack or scalp M15 + pullback + RSI workflow.
     if (strategyMode === "SCALP_M15") {
@@ -5482,6 +6605,30 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       localChecks.push(createPolicyCheck("auto_risk_guard", true, "Risk guard within target"));
     }
 
+    if (guardSpec) {
+      const moneyPerPricePerLot = guardSpec.tickSize > 0 ? guardSpec.tickValue / guardSpec.tickSize : 0;
+      const entry = Number(orderPlan.entryForRisk);
+      const pointSize = getPointSizeForSymbol(symbol, entry);
+      if (
+        Number.isFinite(entry) &&
+        entry > 0 &&
+        Number.isFinite(lots) &&
+        lots > 0 &&
+        Number.isFinite(moneyPerPricePerLot) &&
+        moneyPerPricePerLot > 0
+      ) {
+        const targetDistance = Math.max(pointSize, AGGRESSIVE_AUTO_TP_TARGET_USD / (moneyPerPricePerLot * lots));
+        const fixedTp = orderPlan.side === "BUY" ? entry + targetDistance : entry - targetDistance;
+        if (Number.isFinite(fixedTp) && fixedTp > 0) {
+          orderPlan.tp = fixedTp;
+          orderPlan.tpSource = "RR";
+          orderPlan.fallbackReason = orderPlan.fallbackReason
+            ? `${orderPlan.fallbackReason}; TP targets ~$${AGGRESSIVE_AUTO_TP_TARGET_USD.toFixed(2)}`
+            : `TP targets ~$${AGGRESSIVE_AUTO_TP_TARGET_USD.toFixed(2)}`;
+        }
+      }
+    }
+
     const rrRatioRaw = computeEffectiveRR(
       signal.signal,
       Number(orderPlan.entryForRisk),
@@ -5891,7 +7038,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         pushBotExecutionAuditLog(
           symbol,
           "PREPARE_SENT",
-          `${orderPlan.label} lots=${lots} sl=${Number(orderPlan.sl).toFixed(isCryptoSymbol(symbol) ? 2 : 5)} tp=${Number(orderPlan.tp).toFixed(isCryptoSymbol(symbol) ? 2 : 5)}`
+          `${orderPlan.label} lots=${lots} sl=${Number(orderPlan.sl).toFixed(isCryptoSymbol(symbol) ? 2 : 5)} tp=${Number(orderPlan.tp).toFixed(isCryptoSymbol(symbol) ? 2 : 5)}${orderPlan.rrAtTp ? ` rr=${orderPlan.rrAtTp.toFixed(2)}` : ""}${orderPlan.tpSource ? ` tpSource=${orderPlan.tpSource.toLowerCase()}` : ""}`
         );
 
         tradeCommandBusyRef.current = true;
@@ -5953,7 +7100,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
           "EXECUTION_OK",
           `${orderPlan.label} lots=${lots}${confirmData?.ticket ? ` ticket=${confirmData.ticket}` : ""}${
             confirmData?.price ? ` price=${confirmData.price}` : ""
-          }`
+          }${orderPlan.rrAtTp ? ` rr=${orderPlan.rrAtTp.toFixed(2)}` : ""}${orderPlan.tpSource ? ` tpSource=${orderPlan.tpSource.toLowerCase()}` : ""}`
         );
 
         executed.push(
@@ -6025,7 +7172,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
 
       const prompt = {
         instruction:
-          "Analyze the open MT4 positions. For each position, comment on trend alignment, risk (distance to SL/TP), and whether to hold, reduce, or exit. Be concise and actionable. Assume this is a demo account and use prudent risk language.",
+          "Analyze the open MT5 positions. For each position, comment on trend alignment, risk (distance to SL/TP), and whether to hold, reduce, or exit. Be concise and actionable. Assume this is a demo account and use prudent risk language.",
         positions: enriched,
       };
 
@@ -6234,11 +7381,51 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
     const panelStrategy = panelStrategyIndicators[panelKey];
     const panelTradeSignal = panelData?.tradeSignal;
     const panelPriceData = panelData?.priceData;
+    const livePanelQuote = livePanelQuotes[panelSymbol];
+    const displayedPanelCurrent = livePanelQuote?.mid ?? panelPriceData?.current ?? 0;
+    const displayedPanelChange = panelPriceData ? displayedPanelCurrent - panelPriceData.prevClose : 0;
+    const displayedPanelChangePercent =
+      panelPriceData && panelPriceData.prevClose !== 0
+        ? (displayedPanelChange / panelPriceData.prevClose) * 100
+        : 0;
     const panelIsLoading = Boolean(panelLoading[panelKey]);
     const hasPanelData = Boolean(panelTradeSignal && panelPriceData);
+    const panelEntryMode = resolvePanelEntryMode(panelSymbol, panelTimeframe);
     const strategyTrendData = panelStrategy?.trendData || null;
     const strategyEntryData = panelStrategy?.entryData || null;
     const strategyBias = panelStrategy?.trendBias || null;
+    const strategySetupSignal = panelStrategy?.setupSignal?.signal || "HOLD";
+    const strategyEntrySignal = panelStrategy?.entrySignal?.signal || "HOLD";
+    const structureData = strategyEntryData || panelPriceData || strategyTrendData || null;
+    const supportPriceLabel = structureData ? formatSetupPrice(panelSymbol, structureData.supportLevel) : "--";
+    const resistancePriceLabel = structureData ? formatSetupPrice(panelSymbol, structureData.resistanceLevel) : "--";
+    const chartSetupToneClass = getSetupCardClass(strategyBias);
+    const chartSetupZoneLabel =
+      strategyBias === "BUY" ? "Support zone" : strategyBias === "SELL" ? "Resistance zone" : "Wait for bias";
+    const chartPendingOrderLabel =
+      panelEntryMode === "LIMIT_SR"
+        ? strategyBias === "BUY"
+          ? "BUY_LIMIT"
+          : strategyBias === "SELL"
+          ? "SELL_LIMIT"
+          : "PENDING"
+        : strategyBias === "BUY"
+        ? "BUY MARKET"
+        : strategyBias === "SELL"
+        ? "SELL MARKET"
+        : "WAIT";
+    const chartSetupHeadline =
+      strategyBias === "BUY"
+        ? `Follow ${AUTO_BIAS_TIMEFRAME} BUY bias and buy pullbacks into support`
+        : strategyBias === "SELL"
+        ? `Follow ${AUTO_BIAS_TIMEFRAME} SELL bias and sell pullbacks into resistance`
+        : `Waiting for a clean ${AUTO_BIAS_TIMEFRAME} directional bias`;
+    const chartSetupDetail =
+      strategyBias === "BUY"
+        ? `Bias from ${AUTO_BIAS_TIMEFRAME}, setup on ${AUTO_SETUP_TIMEFRAME}, then ${autoEntryTimeframe} confirmation before placing a ${chartPendingOrderLabel}.`
+        : strategyBias === "SELL"
+        ? `Bias from ${AUTO_BIAS_TIMEFRAME}, setup on ${AUTO_SETUP_TIMEFRAME}, then ${autoEntryTimeframe} confirmation before placing a ${chartPendingOrderLabel}.`
+        : `No directional edge yet. The panel will stay defensive until ${AUTO_BIAS_TIMEFRAME} and ${AUTO_SETUP_TIMEFRAME} align.`;
     const scalpPullbackBuffer =
       autoStrategyMode === "SCALP_M15" && strategyEntryData
         ? Math.max(0, Number(strategyEntryData.atr || 0) * (autoScalpAggressive ? 0.6 : 0.35))
@@ -6311,7 +7498,52 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
             </div>
           </div>
           <div className="text-[11px] text-slate-400">
-            MT4 symbol: <span className="text-slate-200">{resolvedPanelSymbol}</span>
+            MT5 symbol: <span className="text-slate-200">{resolvedPanelSymbol}</span>
+          </div>
+          <div className={`rounded-xl border p-3 shadow-[0_16px_40px_rgba(2,6,23,0.35)] ${chartSetupToneClass}`}>
+            <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+              <div>
+                <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-amber-200/90">Trend Pullback Setup</p>
+                <p className={`text-sm font-semibold mt-1 ${getSetupBiasTone(strategyBias)}`}>{chartSetupHeadline}</p>
+                <p className="text-[11px] mt-1 text-slate-300">{chartSetupDetail}</p>
+              </div>
+              <span className="inline-flex items-center rounded-full border border-amber-300/25 bg-amber-300/10 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-amber-100">
+                {panelEntryMode === "LIMIT_SR" ? "Limit @ S/R" : "Market Entry"}
+              </span>
+            </div>
+            <div className="mt-3 grid gap-2 sm:grid-cols-4">
+              <div className="rounded-lg border border-white/10 bg-slate-950/35 p-2">
+                <p className="text-[10px] uppercase tracking-[0.16em] text-slate-400">Bias</p>
+                <p className={`mt-1 text-xs font-semibold ${getSetupBiasTone(strategyBias)}`}>
+                  {AUTO_BIAS_TIMEFRAME} {strategyBias || "WAIT"}
+                </p>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-slate-950/35 p-2">
+                <p className="text-[10px] uppercase tracking-[0.16em] text-slate-400">Zone</p>
+                <p className="mt-1 text-xs font-semibold text-slate-100">{chartSetupZoneLabel}</p>
+                <p className="text-[10px] text-slate-400">
+                  S {supportPriceLabel} | R {resistancePriceLabel}
+                </p>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-slate-950/35 p-2">
+                <p className="text-[10px] uppercase tracking-[0.16em] text-slate-400">Confirmation</p>
+                <div className="mt-1 flex flex-wrap gap-1">
+                  <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${getSetupBadgeClass(strategySetupSignal)}`}>
+                    {AUTO_SETUP_TIMEFRAME} {strategySetupSignal}
+                  </span>
+                  <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${getSetupBadgeClass(strategyEntrySignal)}`}>
+                    {autoEntryTimeframe} {strategyEntrySignal}
+                  </span>
+                </div>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-slate-950/35 p-2">
+                <p className="text-[10px] uppercase tracking-[0.16em] text-slate-400">Trigger</p>
+                <p className="mt-1 text-xs font-semibold text-slate-100">{chartPendingOrderLabel}</p>
+                <p className="text-[10px] text-slate-400">
+                  {panelEntryMode === "LIMIT_SR" ? "Pending order near structure" : "Immediate execution after confirmation"}
+                </p>
+              </div>
+            </div>
           </div>
           <div className="flex flex-wrap gap-2">
             {TIMEFRAMES.map((tf) => (
@@ -6345,7 +7577,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
         )}
         {!panelIsLoading && !hasPanelData && (
           <div className="mt-3 text-xs text-slate-400">
-            No MT4 analysis data yet for {formatPairLabel(panelSymbol)} {panelTimeframe}.
+            No MT5 analysis data yet for {formatPairLabel(panelSymbol)} {panelTimeframe}.
           </div>
         )}
         {panelTradeSignal && panelPriceData && (
@@ -6361,11 +7593,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
               </div>
               <div className="text-right">
                 <div className="text-sm font-semibold text-slate-100">
-                  ${panelPriceData.current.toFixed(panelIsCrypto ? 2 : 5)}
+                  ${displayedPanelCurrent.toFixed(panelIsCrypto ? 2 : 5)}
                 </div>
-                <div className={panelPriceData.change >= 0 ? "text-emerald-400" : "text-rose-400"}>
-                  {panelPriceData.change >= 0 ? "+" : ""}
-                  {panelPriceData.changePercent.toFixed(2)}%
+                <div className={displayedPanelChange >= 0 ? "text-emerald-400" : "text-rose-400"}>
+                  {displayedPanelChange >= 0 ? "+" : ""}
+                  {displayedPanelChangePercent.toFixed(2)}%
                 </div>
                 {panelPriceData.lastCandleTime ? (
                   <div className="text-[10px] text-slate-500 mt-1">
@@ -6569,13 +7801,13 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
       {/* IMPORTANT DISCLAIMER
       <div className="card bg-amber-500/10 border-2 border-amber-500/50">
         <div className="flex gap-3">
-          <span className="text-2xl">âœ“</span>
+          <span className="text-2xl">ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã¢â‚¬Å“ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ</span>
           <div>
             <h3 className="font-bold text-amber-400 mb-2">USING REAL MARKET DATA</h3>
             <p className="text-sm text-amber-300">
-              <strong>Source:</strong> MT4 bridge candles exported from your logged-in terminal âœ“<br/>
-              <strong>Technical analysis:</strong> RSI, Moving Averages, and MACD computed from MT4 candles<br/>
-              <strong>Execution validation:</strong> Risk policy checks use MT4 live reference candles<br/>
+              <strong>Source:</strong> Native MT5 candles from your logged-in terminal ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã¢â‚¬Å“ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ<br/>
+              <strong>Technical analysis:</strong> RSI, Moving Averages, and MACD computed from MT5 candles<br/>
+              <strong>Execution validation:</strong> Risk policy checks use MT5 live reference candles<br/>
             </p>
             <p className="text-xs text-amber-200 mt-2">
               Always conduct your own research. Past performance does not guarantee future results.
@@ -6637,7 +7869,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
               </pre>
             ) : (
               <p className="text-sm text-slate-400">
-                Scan watchlist symbols using price action + external market news and generate today’s best trade shortlist.
+                Scan watchlist symbols using price action + external market news and generate todayÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢s best trade shortlist.
               </p>
             )}
           </div>
@@ -6811,15 +8043,15 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
               </div>
             )}
             <p className={`text-xs ${THEME.TEXT_SECONDARY} mt-3`}>
-              Candles: Green = Up, Red = Down. Check the chart header for active data source (MT4).
+              Candles: Green = Up, Red = Down. Check the chart header for active data source (MT5).
             </p>
           </div>
 
           {/* Entry & Exit Strategy (moved to chart panels) */}
-          {/* MT4 Trading Panel */}
+          {/* MT5 Trading Panel */}
           <div className="card border border-blue-400/30">
             <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between mb-4">
-              <h4 className={`font-bold ${THEME.TEXT_PRIMARY}`}>MT4 Trading Panel (Guarded)</h4>
+              <h4 className={`font-bold ${THEME.TEXT_PRIMARY}`}>MT5 Trading Panel (Guarded)</h4>
               <div className="flex items-center gap-2">
                 <button
                   type="button"
@@ -6893,7 +8125,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                   <p>
                     Headless runtime: {headlessRuntimeStatus.autoRunning ? "running" : "idle"}
                     {headlessRuntimeStatus.autoBusy ? " | scan in progress" : ""}
-                    {headlessRuntimeStatus.commandBusy ? " | MT4 command busy" : ""}
+                    {headlessRuntimeStatus.commandBusy ? " | MT5 command busy" : ""}
                   </p>
                   {headlessRuntimeStatus.lastAutoCompletedAtMs > 0 && (
                     <p className="text-slate-400 mt-1">
@@ -7290,27 +8522,26 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
             {showTradeSettings && (
               <div className="mb-4 p-3 rounded border border-slate-600 bg-slate-800/50">
                 <div className="flex items-center justify-between mb-3">
-                  <p className="text-sm font-semibold text-slate-200">Trading Settings</p>
+                  <p className="text-sm font-semibold text-slate-200">GOLD + ETH Setup</p>
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={loadRecommendedTradingConfig}
-                      title="Reset the visible controls back to the recommended primary setup without changing the auto-trade or protect enable toggles."
+                      onClick={() =>
+                        updateSelectedManagedSymbolTradeDraft(
+                          buildManagedSymbolTradeDraft(selectedManagedSymbol, headlessRuntimeConfig)
+                        )
+                      }
+                      title="Reload the selected symbol draft from the active managed profile."
                       className="px-2 py-1 text-[11px] rounded border border-slate-600 bg-slate-700/50 text-slate-200 hover:border-slate-500"
                     >
-                      Reset Primary Setup
+                      Reload Selected
                     </button>
                     <button
                       type="button"
-                      onClick={() =>
-                        applyAutoTradeSettings(autoTradeDraft, {
-                          statusMessage: "Trading settings saved and applied. Rechecking policy diagnostics...",
-                          alertMessage: "Trading settings saved and applied.",
-                        })
-                      }
+                      onClick={() => void applySelectedManagedSymbolSettings()}
                       className="px-2 py-1 text-[11px] rounded border border-emerald-400/60 bg-emerald-400/10 text-emerald-200 hover:bg-emerald-400/20"
                     >
-                      Sync Now
+                      Apply Selected
                     </button>
                     <button
                       type="button"
@@ -7324,50 +8555,47 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                 <div className="space-y-3">
                   <div className="grid xl:grid-cols-[minmax(0,2fr)_minmax(280px,1fr)] gap-3">
                     <div className="rounded border border-slate-700 bg-slate-900/40 p-3">
-                      <p className="text-xs font-semibold text-cyan-200 mb-2">Primary Setup</p>
+                      <p className="text-xs font-semibold text-cyan-200 mb-2">Selected Symbol Setup</p>
                       <p className="text-[11px] text-slate-400 mb-3">
-                        Keep the setup simple: choose the strategy, choose the entry behavior, and adjust only the main trade filters. Changes auto-sync to the active runtime and local storage.
+                        Choose `GOLD` or `ETHUSD`, load that symbol's profile, then apply only the selected symbol. Shared account and protection controls stay outside this symbol-level apply flow.
                       </p>
+                      <div className="flex flex-wrap gap-2 mb-3">
+                        {MANAGED_SYMBOLS.map((symbol) => {
+                          const active = selectedManagedSymbol === symbol;
+                          return (
+                            <button
+                              key={`managed-symbol-toggle-${symbol}`}
+                              type="button"
+                              onClick={() => setSelectedManagedSymbol(symbol)}
+                              className={`px-3 py-1.5 rounded border text-xs font-semibold ${
+                                active
+                                  ? symbol === "GOLD"
+                                    ? "border-amber-400/60 bg-amber-400/10 text-amber-200"
+                                    : "border-cyan-400/60 bg-cyan-400/10 text-cyan-200"
+                                  : "border-slate-600 bg-slate-800 text-slate-300 hover:border-slate-500"
+                              }`}
+                            >
+                              {symbol === "GOLD" ? "GOLD M5" : "ETHUSD M15"}
+                            </button>
+                          );
+                        })}
+                      </div>
                       <div className="grid md:grid-cols-2 xl:grid-cols-3 gap-3">
-                        <label className="text-xs" title="Select account contract profile used for symbol suffix and risk assumptions.">
-                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Account Profile</span>
-                          <select
-                            value={accountProfile}
-                            onChange={(e) => setAccountProfile(e.target.value as "STANDARD" | "MICRO")}
-                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
-                          >
-                            <option value="STANDARD">Ultra Low Standard (#)</option>
-                            <option value="MICRO">Ultra Low Micro (m#)</option>
-                          </select>
-                        </label>
-
-                        <label className="text-xs" title="Select strategy profile. Scalper mode uses M15 trend with M1 or M5 entries.">
-                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Strategy</span>
-                          <select
-                            value={autoTradeDraft.strategyMode}
-                            onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({
-                                ...prev,
-                                strategyMode: e.target.value as AutoStrategyMode,
-                                entryTimeframe:
-                                  e.target.value === "SCALP_M15" && prev.entryTimeframe === "M15"
-                                    ? "M5"
-                                    : prev.entryTimeframe,
-                              }))
-                            }
-                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
-                          >
-                            <option value="SCALP_M15">Scalper (M15 -&gt; M1/M5)</option>
-                            <option value="CLASSIC_STACK">Classic (H4/H1 + Entry)</option>
-                          </select>
+                        <label className="text-xs" title="Managed strategy used by the selected symbol profile.">
+                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Strategy Profile</span>
+                          <input
+                            value={selectedManagedSymbol === "GOLD" ? "GOLD Trend Pullback" : "ETH Trend Pullback"}
+                            readOnly
+                            className="w-full px-2 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-300"
+                          />
                         </label>
 
                         <label className="text-xs" title="Limit auto-trading to buy-only, sell-only, or allow both sides.">
                           <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Trade Side</span>
                           <select
-                            value={autoTradeDraft.sideFilter}
+                            value={selectedManagedSymbolTradeDraft.sideFilter}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({
                                 ...prev,
                                 sideFilter: e.target.value as AutoSideFilter,
                               }))
@@ -7380,97 +8608,30 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                           </select>
                         </label>
 
-                        {autoTradeDraft.strategyMode === "CLASSIC_STACK" ? (
-                          <label className="text-xs" title="Choose timeframe used by auto-trade analysis. PANEL means each chart uses its own timeframe.">
-                            <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Analysis Timeframe</span>
-                            <select
-                              value={autoTradeDraft.timeframeOverride}
-                              onChange={(e) =>
-                                setAutoTradeDraft((prev) => ({
-                                  ...prev,
-                                  timeframeOverride: e.target.value as ChartTimeframe | "PANEL",
-                                }))
-                              }
-                              className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
-                            >
-                              <option value="PANEL">Use panel timeframe</option>
-                              {TIMEFRAMES.map((tf) => (
-                                <option key={`auto-tf-${tf}`} value={tf}>
-                                  {tf}
-                                </option>
-                              ))}
-                            </select>
-                          </label>
-                        ) : (
-                          <label className="text-xs" title="Scalper mode always uses M15 EMA50 for the primary trend bias.">
-                            <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Trend Bias</span>
-                            <input
-                              value="M15 EMA50"
-                              readOnly
-                              className="w-full px-2 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-300"
-                            />
-                          </label>
-                        )}
-
-                        <label className="text-xs" title="Lower timeframe used for entry alignment.">
-                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Entry Timeframe</span>
-                          <select
-                            value={autoTradeDraft.entryTimeframe}
-                            onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({
-                                ...prev,
-                                entryTimeframe: e.target.value as AutoEntryTiming,
-                              }))
-                            }
-                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
-                          >
-                            {autoTradeDraft.strategyMode === "CLASSIC_STACK" && <option value="M15">M15</option>}
-                            <option value="M5">M5</option>
-                            <option value="M1">M1</option>
-                          </select>
+                        <label className="text-xs" title="Managed entry behavior uses pending limit orders at support or resistance in the H4 direction.">
+                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Entry Model</span>
+                          <input
+                            value={selectedManagedSymbolTradeDraft.entryMode === "LIMIT_SR" ? "BUY_LIMIT / SELL_LIMIT @ S/R" : "MARKET"}
+                            readOnly
+                            className="w-full px-2 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-300"
+                          />
                         </label>
 
-                        <label className="text-xs" title="Post-cooldown confirmation profile applied before the bot can re-enter a symbol.">
-                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Re-entry Mode</span>
-                          <select
-                            value={autoTradeDraft.reentryMode}
-                            onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({
-                                ...prev,
-                                reentryMode: e.target.value as AutoReentryMode,
-                              }))
-                            }
-                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
-                          >
-                            <option value="OFF">Off</option>
-                            <option value="BALANCED">Balanced</option>
-                            <option value="STRICT">Strict</option>
-                          </select>
-                        </label>
-
-                        <label className="text-xs" title="MARKET executes immediately at current price. LIMIT @ S/R places pending limit orders near support or resistance.">
-                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Entry Mode</span>
-                          <select
-                            value={autoTradeDraft.entryMode}
-                            onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({
-                                ...prev,
-                                entryMode: e.target.value as AutoEntryMode,
-                              }))
-                            }
-                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
-                          >
-                            <option value="MARKET">Market</option>
-                            <option value="LIMIT_SR">Limit @ S/R</option>
-                          </select>
+                        <label className="text-xs" title="Current managed symbol being edited.">
+                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Selected Symbol</span>
+                          <input
+                            value={selectedManagedSymbol === "GOLD" ? "GOLD M5" : "ETHUSD M15"}
+                            readOnly
+                            className="w-full px-2 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-300"
+                          />
                         </label>
 
                         <label className="text-xs" title="Minimum signal confidence required before auto-trade can execute.">
                           <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Min Confidence %</span>
                           <input
-                            value={autoTradeDraft.minConfidence}
+                            value={selectedManagedSymbolTradeDraft.minConfidence}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, minConfidence: e.target.value }))
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, minConfidence: e.target.value }))
                             }
                             className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
                           />
@@ -7479,9 +8640,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         <label className="text-xs" title="Minimum modeled win rate required before auto-trade can execute.">
                           <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Min Win Rate %</span>
                           <input
-                            value={autoTradeDraft.minWinRate}
+                            value={selectedManagedSymbolTradeDraft.minWinRate}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, minWinRate: e.target.value }))
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, minWinRate: e.target.value }))
                             }
                             className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
                           />
@@ -7490,9 +8651,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         <label className="text-xs" title="Minimum reward-to-risk ratio required by policy.">
                           <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Min R:R</span>
                           <input
-                            value={autoTradeDraft.minRR}
+                            value={selectedManagedSymbolTradeDraft.minRR}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, minRR: e.target.value }))
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, minRR: e.target.value }))
                             }
                             className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
                           />
@@ -7501,9 +8662,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         <label className="text-xs" title="Base spread guard in points before symbol multipliers are applied. Gold uses a 1.25x multiplier on top of this value.">
                           <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Max Spread Points</span>
                           <input
-                            value={autoTradeDraft.maxSpreadPoints}
+                            value={selectedManagedSymbolTradeDraft.maxSpreadPoints}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, maxSpreadPoints: e.target.value }))
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, maxSpreadPoints: e.target.value }))
                             }
                             className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
                           />
@@ -7512,9 +8673,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         <label className="text-xs" title="Minimum wait time between trades on the same symbol.">
                           <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Cooldown (minutes)</span>
                           <input
-                            value={autoTradeDraft.cooldownMin}
+                            value={selectedManagedSymbolTradeDraft.cooldownMin}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, cooldownMin: e.target.value }))
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, cooldownMin: e.target.value }))
                             }
                             className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
                           />
@@ -7523,9 +8684,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         <label className="text-xs" title="Maximum number of open positions allowed at the same time across all symbols.">
                           <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Max Active Trades</span>
                           <input
-                            value={autoTradeDraft.maxOpenTrades}
+                            value={selectedManagedSymbolTradeDraft.maxOpenTrades}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, maxOpenTrades: e.target.value }))
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, maxOpenTrades: e.target.value }))
                             }
                             className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
                           />
@@ -7534,9 +8695,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         <label className="text-xs" title="Choose whether dynamic lot sizing uses a percent of balance or a fixed USD risk target.">
                           <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Risk Mode</span>
                           <select
-                            value={autoTradeDraft.riskMode}
+                            value={selectedManagedSymbolTradeDraft.riskMode}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, riskMode: e.target.value as "PCT" | "USD" }))
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, riskMode: e.target.value as "PCT" | "USD" }))
                             }
                             className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
                           >
@@ -7548,10 +8709,10 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         <label className="text-xs" title="Risk target as a percentage of account balance per trade.">
                           <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Risk Per Trade %</span>
                           <input
-                            value={autoTradeDraft.riskPct}
-                            disabled={autoTradeDraft.riskMode !== "PCT"}
+                            value={selectedManagedSymbolTradeDraft.riskPct}
+                            disabled={selectedManagedSymbolTradeDraft.riskMode !== "PCT"}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, riskPct: e.target.value }))
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, riskPct: e.target.value }))
                             }
                             className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white disabled:opacity-50"
                           />
@@ -7560,10 +8721,10 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         <label className="text-xs" title="Fixed USD risk target per trade.">
                           <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Risk Per Trade USD</span>
                           <input
-                            value={autoTradeDraft.riskUsd}
-                            disabled={autoTradeDraft.riskMode !== "USD"}
+                            value={selectedManagedSymbolTradeDraft.riskUsd}
+                            disabled={selectedManagedSymbolTradeDraft.riskMode !== "USD"}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, riskUsd: e.target.value }))
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, riskUsd: e.target.value }))
                             }
                             className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white disabled:opacity-50"
                           />
@@ -7572,173 +8733,107 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         <label className="text-xs" title="Base lot size for the bot. With dynamic lot ON this acts as the maximum lot cap. With dynamic lot OFF this becomes the fixed lot used for each trade.">
                           <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Default Bot Lots</span>
                           <input
-                            value={autoTradeDraft.botLots}
+                            value={selectedManagedSymbolTradeDraft.botLots}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, botLots: e.target.value }))
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, botLots: e.target.value }))
                             }
                             className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
                           />
                         </label>
 
-                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="When LIMIT @ S/R cannot build a valid pending order, allow guarded fallback to MARKET entry.">
-                          <input
-                            type="checkbox"
-                            checked={autoTradeDraft.allowMarketFallback}
-                            onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, allowMarketFallback: e.target.checked }))
-                            }
-                          />
-                          Allow market fallback
-                        </label>
-
                         <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="Turn ON to let the bot calculate lot size from your risk settings. Turn OFF to use Default Bot Lots as a fixed lot per trade.">
                           <input
                             type="checkbox"
-                            checked={autoTradeDraft.useDynamicLot}
+                            checked={selectedManagedSymbolTradeDraft.useDynamicLot}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, useDynamicLot: e.target.checked }))
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, useDynamicLot: e.target.checked }))
                             }
                           />
                           Dynamic Lot ON/OFF
                         </label>
 
-                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="If disabled, time-window session gate is bypassed.">
+                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="Require a strong signal before the selected symbol can trade.">
                           <input
                             type="checkbox"
-                            checked={autoTradeDraft.sessionGateEnabled}
+                            checked={selectedManagedSymbolTradeDraft.requireStrong}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, sessionGateEnabled: e.target.checked }))
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, requireStrong: e.target.checked }))
                             }
                           />
-                          Enforce session gate
+                          Require strong signal
                         </label>
 
-                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="If disabled, the daily loss limit policy becomes advisory only and will not block trades.">
+                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="If disabled, symbol cooldown becomes advisory only for the selected symbol.">
                           <input
                             type="checkbox"
-                            checked={autoTradeDraft.enforceDailyLossLimit}
+                            checked={selectedManagedSymbolTradeDraft.enforceSymbolCooldown}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, enforceDailyLossLimit: e.target.checked }))
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, enforceSymbolCooldown: e.target.checked }))
+                            }
+                          />
+                          Enforce symbol cooldown
+                        </label>
+
+                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="If disabled, the daily loss limit policy becomes advisory only for the selected symbol.">
+                          <input
+                            type="checkbox"
+                            checked={selectedManagedSymbolTradeDraft.enforceDailyLossLimit}
+                            onChange={(e) =>
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, enforceDailyLossLimit: e.target.checked }))
                             }
                           />
                           Enforce daily loss limit
                         </label>
 
-                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="If disabled, the classic H4/H1/Entry trend stack filter becomes advisory only and will not block trades.">
+                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="If disabled, the hard risk block becomes advisory only for the selected symbol.">
                           <input
                             type="checkbox"
-                            checked={autoTradeDraft.enforceTrendStack}
+                            checked={selectedManagedSymbolTradeDraft.enforceHardRiskBlock}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, enforceTrendStack: e.target.checked }))
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, enforceHardRiskBlock: e.target.checked }))
                             }
                           />
-                          Enforce trend stack
+                          Enforce hard risk block
                         </label>
 
-                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="Enable automatic ATR-based trailing stop updates for open positions.">
+                        <label className="text-xs" title="Minimum stop distance in points for the selected symbol.">
+                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Min Stop Points</span>
                           <input
-                            type="checkbox"
-                            checked={protectEnabled}
-                            onChange={(e) => setProtectEnabled(e.target.checked)}
-                          />
-                          Auto Protect
-                        </label>
-
-                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="When opposite bias appears, only close automatically after the trade has already progressed far enough toward TP.">
-                          <input
-                            type="checkbox"
-                            checked={protectBiasFlipProfitLockEnabled}
-                            onChange={(e) => setProtectBiasFlipProfitLockEnabled(e.target.checked)}
-                          />
-                          Bias Flip Profit Lock
-                        </label>
-
-                        <label className="text-xs" title="Minimum TP progress required before an opposite strong signal can lock in profit and close the trade.">
-                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>TP Progress %</span>
-                          <input
-                            value={protectBiasFlipTpProgressPct}
-                            disabled={!protectBiasFlipProfitLockEnabled}
-                            onChange={(e) => setProtectBiasFlipTpProgressPct(e.target.value)}
-                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white disabled:opacity-50"
-                          />
-                        </label>
-
-                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="For overnight trades, arm a profit lock after open PnL reaches a threshold, then close if too much of that profit is given back.">
-                          <input
-                            type="checkbox"
-                            checked={protectOvernightProfitRetraceLockEnabled}
-                            onChange={(e) => setProtectOvernightProfitRetraceLockEnabled(e.target.checked)}
-                          />
-                          Overnight Profit Retrace Lock
-                        </label>
-
-                        <label className="text-xs" title="Arm the overnight retrace lock once floating profit reaches this USD amount.">
-                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Retrace Arm USD</span>
-                          <input
-                            value={protectOvernightProfitRetraceArmUsd}
-                            disabled={!protectOvernightProfitRetraceLockEnabled}
-                            onChange={(e) => setProtectOvernightProfitRetraceArmUsd(e.target.value)}
-                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white disabled:opacity-50"
-                          />
-                        </label>
-
-                        <label className="text-xs" title="After the retrace lock is armed, close the overnight trade if floating profit falls back to this USD amount or lower.">
-                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Retrace Close USD</span>
-                          <input
-                            value={protectOvernightProfitRetraceCloseUsd}
-                            disabled={!protectOvernightProfitRetraceLockEnabled}
-                            onChange={(e) => setProtectOvernightProfitRetraceCloseUsd(e.target.value)}
-                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white disabled:opacity-50"
-                          />
-                        </label>
-
-                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2" title="Keep scanning and close open positions automatically once floating profit reaches the USD target.">
-                          <input
-                            type="checkbox"
-                            checked={protectOvernightEnabled}
-                            onChange={(e) => setProtectOvernightEnabled(e.target.checked)}
-                          />
-                          Overnight mode
-                        </label>
-
-                        <label className="text-xs" title="Floating USD profit target that triggers an automatic close in overnight mode.">
-                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>Overnight Profit USD</span>
-                          <input
-                            value={protectOvernightProfitUsd}
-                            disabled={!protectOvernightEnabled}
-                            onChange={(e) => setProtectOvernightProfitUsd(e.target.value)}
-                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white disabled:opacity-50"
-                          />
-                        </label>
-
-                        <label className="inline-flex items-center gap-2 text-xs text-slate-300 mt-2 xl:col-span-3" title="Relaxes scalp trend, pullback, RSI and session filters for more frequent entries.">
-                          <input
-                            type="checkbox"
-                            checked={autoTradeDraft.scalpAggressive}
-                            disabled={autoTradeDraft.strategyMode !== "SCALP_M15"}
+                            value={selectedManagedSymbolTradeDraft.minSlPoints}
                             onChange={(e) =>
-                              setAutoTradeDraft((prev) => ({ ...prev, scalpAggressive: e.target.checked }))
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, minSlPoints: e.target.value }))
                             }
+                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
                           />
-                          Scalper aggressive mode
+                        </label>
+
+                        <label className="text-xs" title="ATR buffer multiplier used when building stop distance around structure.">
+                          <span className={`block mb-1 ${THEME.TEXT_SECONDARY}`}>ATR Buffer</span>
+                          <input
+                            value={selectedManagedSymbolTradeDraft.atrBufferMult}
+                            onChange={(e) =>
+                              updateSelectedManagedSymbolTradeDraft((prev) => ({ ...prev, atrBufferMult: e.target.value }))
+                            }
+                            className="w-full px-2 py-1.5 rounded bg-slate-800 border border-slate-600 text-white"
+                          />
                         </label>
                       </div>
                       <div className="mt-3 text-[11px] text-slate-400">
-                        {accountProfile === "MICRO"
-                          ? "Micro account uses the m# symbols and much smaller contract size. Double-check lots before going live."
-                          : "Standard account uses the # symbols. Advanced lot and risk guard parameters stay on the managed defaults."}
+                        {selectedManagedSymbol === "GOLD"
+                          ? "Editing the GOLD M5 managed profile. This symbol keeps the stricter metal setup and overnight handling in the headless runtime."
+                          : "Editing the ETHUSD M15 managed profile. This symbol keeps the looser crypto pullback setup and no overnight auto-close profile."}
                       </div>
                       <div className="mt-2 text-[11px] text-slate-400">
-                        Risk target applies to stop-loss exposure when dynamic lot sizing is on. If Dynamic Lot is off, Default Bot Lots becomes the fixed lot per trade.
+                        These controls affect only the selected symbol when you click `Apply Selected`.
                       </div>
                     </div>
 
                     <div className="space-y-3">
-                      {settingsWarnings.length > 0 && (
+                      {selectedManagedSymbolWarnings.length > 0 && (
                         <div className="rounded border border-amber-500/40 bg-amber-500/10 p-2">
                           <p className="text-xs font-semibold text-amber-300 mb-1">Settings Warnings</p>
                           <div className="space-y-1">
-                            {settingsWarnings.map((warning, idx) => (
+                            {selectedManagedSymbolWarnings.map((warning, idx) => (
                               <p key={`settings-warning-${idx}`} className="text-[11px] text-amber-200">
                                 - {warning}
                               </p>
@@ -7747,11 +8842,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         </div>
                       )}
 
-                      {hasUnappliedTradeSettings && (
+                      {hasSelectedManagedSymbolUnappliedChanges && (
                         <div className="rounded border border-cyan-500/40 bg-cyan-500/10 p-2">
                           <p className="text-xs font-semibold text-cyan-200 mb-1">Unapplied Changes</p>
                           <p className="text-[11px] text-cyan-100">
-                            The visible Trading Settings draft differs from the active applied settings. Click `Apply` to sync browser checks, saved local settings, and headless payload.
+                            The visible {selectedManagedSymbol} draft differs from the active applied profile. Click `Apply Selected` to sync only this symbol.
                           </p>
                         </div>
                       )}
@@ -7769,34 +8864,102 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         </div>
                       )}
 
-                      {autoTradeDraft.strategyMode === "SCALP_M15" ? (
-                        <div className="rounded border border-emerald-500/30 bg-emerald-500/10 p-2">
-                          <p className="text-xs font-semibold text-emerald-200 mb-1">Scalper Profile</p>
-                          <p className="text-[11px] text-emerald-100">
-                            M15 EMA50 defines the trend. Entries use {autoTradeDraft.entryTimeframe} pullback plus RSI confirmation across all symbols.
-                            {autoTradeDraft.scalpAggressive
-                              ? " Aggressive mode is ON, so pullback and RSI windows are wider."
-                              : " Aggressive mode is OFF, so pullback and RSI checks stay tighter."}
-                          </p>
-                        </div>
-                      ) : (
-                        <div className="rounded border border-cyan-500/30 bg-cyan-500/10 p-2">
-                          <p className="text-xs font-semibold text-cyan-200 mb-1">Classic Profile</p>
-                          <p className="text-[11px] text-cyan-100">
-                            Uses H4 bias plus H1 setup alignment, then {autoTradeDraft.entryTimeframe} for the final gold entry confirmation.
-                          </p>
-                        </div>
-                      )}
-
-                      <div className="rounded border border-slate-600 bg-slate-900/50 p-2">
-                        <p className="text-xs font-semibold text-slate-200 mb-1">Re-entry Profile</p>
-                        <p className="text-[11px] text-slate-300">
-                          {autoTradeDraft.reentryMode === "OFF"
-                            ? "Cooldown still applies, but no extra M5/M1 re-entry confirmation is required after it expires."
-                            : autoTradeDraft.reentryMode === "STRICT"
-                            ? "Strict mode requires 4/4 closed M5 candles aligned with bias, plus latest closed M1 signal, candle direction, and EMA50 alignment."
-                            : "Balanced mode requires 3/4 closed M5 candles plus net move in bias direction, then latest closed M1 signal and candle confirmation."}
-                        </p>
+                      <div className="grid gap-3 md:grid-cols-2">
+                        {managedSetupCards.map((card) => (
+                          <div
+                            key={`managed-setup-card-${card.symbol}`}
+                            className={`rounded border p-3 ${card.accent.border} ${card.accent.bg}`}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div>
+                                <p className={`text-xs font-semibold ${card.accent.title}`}>{card.title}</p>
+                                <p className={`text-[11px] ${card.accent.text}`}>{card.description}</p>
+                              </div>
+                              <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${card.accent.pill}`}>
+                                {card.entryMode === "LIMIT_SR" ? "LIMIT @ S/R" : "MARKET"}
+                              </span>
+                            </div>
+                            <div className="mt-3">
+                              <p className={`text-[11px] font-semibold ${card.accent.title}`}>Trading Settings</p>
+                            </div>
+                            <div className="grid grid-cols-2 gap-2 text-[11px] mt-2">
+                              <div className="rounded border border-slate-800/70 bg-slate-950/40 p-2">
+                                <p className="text-slate-400">Timeframe</p>
+                                <p className="text-slate-100">{card.timeframe}</p>
+                              </div>
+                              <div className="rounded border border-slate-800/70 bg-slate-950/40 p-2">
+                                <p className="text-slate-400">Bias Path</p>
+                                <p className="text-slate-100">{card.biasPath}</p>
+                              </div>
+                              <div className="rounded border border-slate-800/70 bg-slate-950/40 p-2">
+                                <p className="text-slate-400">Trade Side</p>
+                                <p className="text-slate-100">{card.sideFilterLabel}</p>
+                              </div>
+                              <div className="rounded border border-slate-800/70 bg-slate-950/40 p-2">
+                                <p className="text-slate-400">Entry Mode</p>
+                                <p className="text-slate-100">{card.entryMode === "LIMIT_SR" ? "BUY_LIMIT / SELL_LIMIT" : "MARKET"}</p>
+                              </div>
+                              <div className="rounded border border-slate-800/70 bg-slate-950/40 p-2">
+                                <p className="text-slate-400">Min Confidence</p>
+                                <p className="text-slate-100">{card.minConfidence}%</p>
+                              </div>
+                              <div className="rounded border border-slate-800/70 bg-slate-950/40 p-2">
+                                <p className="text-slate-400">Min Win Rate</p>
+                                <p className="text-slate-100">{card.minWinRate}%</p>
+                              </div>
+                              <div className="rounded border border-slate-800/70 bg-slate-950/40 p-2">
+                                <p className="text-slate-400">Min R:R</p>
+                                <p className="text-slate-100">{card.minRR.toFixed(1)}R</p>
+                              </div>
+                              <div className="rounded border border-slate-800/70 bg-slate-950/40 p-2">
+                                <p className="text-slate-400">Max Spread</p>
+                                <p className="text-slate-100">{card.maxSpreadPoints} pts</p>
+                              </div>
+                              <div className="rounded border border-slate-800/70 bg-slate-950/40 p-2">
+                                <p className="text-slate-400">Cooldown</p>
+                                <p className="text-slate-100">{card.cooldownMin} minutes</p>
+                              </div>
+                              <div className="rounded border border-slate-800/70 bg-slate-950/40 p-2">
+                                <p className="text-slate-400">Min Stop</p>
+                                <p className="text-slate-100">{card.minSlPoints} pts</p>
+                              </div>
+                              <div className="rounded border border-slate-800/70 bg-slate-950/40 p-2">
+                                <p className="text-slate-400">ATR Buffer</p>
+                                <p className="text-slate-100">x{card.atrBufferMult.toFixed(2)}</p>
+                              </div>
+                            </div>
+                            <div className="mt-3">
+                              <p className={`text-[11px] font-semibold ${card.accent.title}`}>Protection & Filters</p>
+                            </div>
+                            <div className="mt-2 flex flex-wrap gap-2 text-[10px]">
+                              <span className="rounded-full border border-slate-700 bg-slate-950/60 px-2 py-0.5 text-slate-200">
+                                {card.requireStrong ? "STRONG signal required" : "Signal strength relaxed"}
+                              </span>
+                              <span className="rounded-full border border-slate-700 bg-slate-950/60 px-2 py-0.5 text-slate-200">
+                                {card.newsFilterEnabled ? "News filter ON" : "News filter OFF"}
+                              </span>
+                              <span className="rounded-full border border-slate-700 bg-slate-950/60 px-2 py-0.5 text-slate-200">
+                                {card.ma200FlatEnabled ? "MA200 flat guard ON" : "MA200 flat guard OFF"}
+                              </span>
+                              <span className="rounded-full border border-slate-700 bg-slate-950/60 px-2 py-0.5 text-slate-200">
+                                {card.overnightEnabled ? "Overnight protect ON" : "No overnight auto-close"}
+                              </span>
+                              <span className="rounded-full border border-slate-700 bg-slate-950/60 px-2 py-0.5 text-slate-200">
+                                {card.symbolCooldown ? "Symbol cooldown ON" : "Symbol cooldown OFF"}
+                              </span>
+                              <span className="rounded-full border border-slate-700 bg-slate-950/60 px-2 py-0.5 text-slate-200">
+                                {card.hardRiskBlock ? "Hard risk block ON" : "Hard risk block OFF"}
+                              </span>
+                              <span className="rounded-full border border-slate-700 bg-slate-950/60 px-2 py-0.5 text-slate-200">
+                                {card.breakEvenEnabled ? `Break-even +$${card.breakEvenProfitUsd.toFixed(2)}` : "Break-even OFF"}
+                              </span>
+                              <span className="rounded-full border border-slate-700 bg-slate-950/60 px-2 py-0.5 text-slate-200">
+                                {card.degradeCloseEnabled ? "Opposite-signal exit ON" : "Opposite-signal exit OFF"}
+                              </span>
+                            </div>
+                            <p className="mt-3 text-[11px] text-slate-300">{card.notes}</p>
+                          </div>
+                        ))}
                       </div>
 
                       <div className={`rounded p-2 ${autoTradeDraft.sessionGateEnabled ? "border border-cyan-500/30 bg-cyan-500/10" : "border border-amber-500/30 bg-amber-500/10"}`}>
@@ -7817,28 +8980,19 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         </p>
                       </div>
 
-                      <div className={`rounded p-2 ${autoTradeDraft.enforceTrendStack ? "border border-slate-600 bg-slate-900/50" : "border border-amber-500/30 bg-amber-500/10"}`}>
-                        <p className={`text-xs font-semibold mb-1 ${autoTradeDraft.enforceTrendStack ? "text-slate-200" : "text-amber-200"}`}>Trend Stack</p>
-                        <p className={`text-[11px] ${autoTradeDraft.enforceTrendStack ? "text-slate-300" : "text-amber-100"}`}>
-                          {autoTradeDraft.enforceTrendStack
-                            ? "Classic H4/H1/Entry alignment remains a blocking filter."
-                            : "Trend stack is disabled. Classic alignment checks stay visible in diagnostics but no longer block trades."}
-                        </p>
-                      </div>
-
                       <div className={`rounded p-2 ${protectOvernightEnabled ? "border border-emerald-500/30 bg-emerald-500/10" : "border border-slate-600 bg-slate-900/50"}`}>
                         <p className={`text-xs font-semibold mb-1 ${protectOvernightEnabled ? "text-emerald-200" : "text-slate-200"}`}>Overnight Mode</p>
                         <p className={`text-[11px] ${protectOvernightEnabled ? "text-emerald-100" : "text-slate-300"}`}>
                           {protectOvernightEnabled
-                            ? `Gold-only overnight mode opens normal H4/H1/M5 trades, blocks strong MA200 trends, skips high-impact NFP/CPI/FOMC windows, moves SL to entry at +$${Number(protectBreakEvenProfitUsd || 0).toFixed(2)}, closes at +$${Number(protectOvernightProfitUsd || 0).toFixed(2)} or -$${Number(protectOvernightLossUsd || 0).toFixed(2)}, then enforces the ${autoTradeDraft.cooldownMin}-minute cooldown. Three consecutive losing managed trades disable overnight mode and block the next auto trade.`
+                            ? `GOLD keeps the overnight H4/H1/M5 profile, blocks strong MA200 trends, skips high-impact NFP/CPI/FOMC windows, moves SL to entry at +$${Number(protectBreakEvenProfitUsd || 0).toFixed(2)}, closes at +$${Number(protectOvernightProfitUsd || 0).toFixed(2)} or -$${Number(protectOvernightLossUsd || 0).toFixed(2)}, then enforces the ${autoTradeDraft.cooldownMin}-minute cooldown. ETH stays on its separate M15 trend-pullback profile and does not use these overnight exits.`
                             : "Overnight mode is off."}
                         </p>
                       </div>
 
                       <div className="rounded border border-slate-700 bg-slate-950/40 p-2">
-                        <p className="text-xs font-semibold text-slate-200 mb-1">What is hidden</p>
+                        <p className="text-xs font-semibold text-slate-200 mb-1">Hidden Defaults</p>
                         <p className="text-[11px] text-slate-400">
-                          Advanced trend-flat, news-blackout, and exit tuning stay on the recommended preset to keep this panel readable.
+                          Strategy mode, trend-stack enforcement, re-entry tuning, and news blackout logic stay on the managed preset to keep this panel focused on risk and protection.
                         </p>
                       </div>
                     </div>
@@ -7848,7 +9002,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                     <div className="flex items-center justify-between gap-2 flex-wrap">
                       <div>
                         <p className="text-xs font-semibold text-slate-200">Managed Defaults</p>
-                        <p className="text-[11px] text-slate-400">Headless sync is pinned to a gold-only M5 preset unless you change the preset in code or restore a different saved config.</p>
+                        <p className="text-[11px] text-slate-400">Headless sync runs the managed GOLD M5 and ETHUSD M15 trend-pullback profiles. This panel controls shared risk, filter thresholds, and protection values.</p>
                       </div>
                       {protectStatusDisplay && <p className="text-[11px] text-slate-300">{protectStatusDisplay}</p>}
                     </div>
@@ -7870,9 +9024,9 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         <p className="text-slate-300">Min SL {autoTradeDraft.minSlPoints} pts, ATR buffer {autoTradeDraft.atrBufferMult}</p>
                       </div>
                       <div className="rounded border border-slate-700 bg-slate-950/40 p-2">
-                        <p className="text-slate-400">Fallback</p>
-                        <p className="text-slate-100">{autoTradeDraft.allowMarketFallback ? `ON at ${autoTradeDraft.fallbackMinConfidence}%` : "OFF"}</p>
-                        <p className="text-slate-300">Extra R:R buffer {autoTradeDraft.fallbackRrBuffer}</p>
+                        <p className="text-slate-400">Entry Model</p>
+                        <p className="text-slate-100">Pending limits at support / resistance</p>
+                        <p className="text-slate-300">No market fallback in the managed runtime</p>
                       </div>
                       <div className="rounded border border-slate-700 bg-slate-950/40 p-2">
                         <p className="text-slate-400">Loss Guard</p>
@@ -7883,12 +9037,11 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                         <p className="text-slate-400">Cooldown Guard</p>
                         <p className="text-slate-100">Symbol cooldown {autoTradeDraft.enforceSymbolCooldown ? "ON" : "OFF"}</p>
                         <p className="text-slate-300">{autoTradeDraft.cooldownMin} minute wait per symbol</p>
-                        <p className="text-slate-300">Re-entry {autoTradeDraft.reentryMode}</p>
                       </div>
                       <div className="rounded border border-slate-700 bg-slate-950/40 p-2">
                         <p className="text-slate-400">Trend Filter</p>
-                        <p className="text-slate-100">Trend stack {autoTradeDraft.enforceTrendStack ? "ON" : "OFF"}</p>
-                        <p className="text-slate-300">Classic H4/H1/Entry alignment plus flat MA200 gate</p>
+                        <p className="text-slate-100">H4 direction gate ON</p>
+                        <p className="text-slate-300">H4 bias, H1 setup, entry confirmation, and MA50/RSI/candle checks</p>
                       </div>
                       <div className="rounded border border-slate-700 bg-slate-950/40 p-2">
                         <p className="text-slate-400">News Guard</p>
@@ -8028,7 +9181,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                 {symbolSpec && (
                   <div className="mb-4 p-3 rounded border border-slate-600 bg-slate-800/40">
                     <p className="text-xs text-slate-300">
-                      MT4 Contract: <span className="text-slate-100">{symbolSpec.symbol}</span> |
+                      MT5 Contract: <span className="text-slate-100">{symbolSpec.symbol}</span> |
                       {" "}1 lot = <span className="text-slate-100">{Number(symbolSpec.lotSize || 0).toLocaleString()}</span> units |
                       {" "}Digits {symbolSpec.digits} | Point {symbolSpec.point}
                     </p>
@@ -8077,7 +9230,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                     value={orderLots}
                     onChange={(e) => setOrderLots(e.target.value)}
                     className="w-full px-3 py-2 rounded bg-slate-800 border border-slate-600 text-white"
-                    placeholder="0.10"
+                    placeholder="0.01"
                   />
                 </label>
               )}
@@ -8285,7 +9438,7 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
               </pre>
             ) : (
               <p className="text-sm text-slate-400">
-                Generate AI analysis for all open MT4 positions.
+                Generate AI analysis for all open MT5 positions.
               </p>
             )}
           </div>
@@ -8293,8 +9446,10 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
           <div className="card border border-slate-600 bg-slate-800/40">
             <div className="flex items-center justify-between mb-2">
               <div>
-                <p className="text-sm font-semibold text-slate-100">Policy Diagnostics (All Panels)</p>
-                <p className="text-[10px] text-slate-400">Applied max open trades: {effectiveMaxOpenTrades}</p>
+                <p className="text-sm font-semibold text-slate-100">Trend Pullback Diagnostics</p>
+                <p className="text-[10px] text-slate-400">
+                  Applied max open trades: {effectiveMaxOpenTrades} | Workflow: {AUTO_BIAS_TIMEFRAME} bias {"->"} {AUTO_SETUP_TIMEFRAME} setup {"->"} {autoEntryTimeframe} confirmation {"->"} {autoEntryMode === "LIMIT_SR" ? "BUY_LIMIT / SELL_LIMIT" : "MARKET"}
+                </p>
               </div>
               <button
                 onClick={runPolicyDiagnostics}
@@ -8304,21 +9459,95 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                 {policyBusy ? "Checking..." : "Recheck"}
               </button>
             </div>
+            <div className="mb-3 rounded-xl border border-amber-300/20 bg-[linear-gradient(135deg,rgba(120,53,15,0.14),rgba(15,23,42,0.86),rgba(30,41,59,0.72))] p-3">
+              <div className="flex flex-col gap-2 lg:flex-row lg:items-end lg:justify-between">
+                <div>
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-amber-200/90">Current Trading Lens</p>
+                  <p className="text-sm font-semibold text-slate-100 mt-1">
+                    Trade only at structure, not in the middle of the move.
+                  </p>
+                  <p className="text-[11px] text-slate-300 mt-1">
+                    GOLD and ETH now present the UI as trend-following pullback setups with pending limit execution near support or resistance.
+                  </p>
+                </div>
+                <span className="inline-flex items-center rounded-full border border-amber-300/25 bg-amber-300/10 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-amber-100">
+                  {autoEntryMode === "LIMIT_SR" ? "Structure Limits Active" : "Market Trigger Active"}
+                </span>
+              </div>
+              <div className="mt-3 grid gap-2 md:grid-cols-4">
+                <div className="rounded-lg border border-white/10 bg-slate-950/35 p-2">
+                  <p className="text-[10px] uppercase tracking-[0.16em] text-slate-400">1. Bias</p>
+                  <p className="mt-1 text-xs font-semibold text-slate-100">Read {AUTO_BIAS_TIMEFRAME} first</p>
+                  <p className="text-[10px] text-slate-400">If {AUTO_BIAS_TIMEFRAME} is BUY, only buy pullbacks. If SELL, only sell pullbacks.</p>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-slate-950/35 p-2">
+                  <p className="text-[10px] uppercase tracking-[0.16em] text-slate-400">2. Zone</p>
+                  <p className="mt-1 text-xs font-semibold text-slate-100">Wait for structure</p>
+                  <p className="text-[10px] text-slate-400">Buy near support. Sell near resistance. Treat levels as zones, not exact lines.</p>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-slate-950/35 p-2">
+                  <p className="text-[10px] uppercase tracking-[0.16em] text-slate-400">3. Confirmation</p>
+                  <p className="mt-1 text-xs font-semibold text-slate-100">{AUTO_SETUP_TIMEFRAME} + {autoEntryTimeframe}</p>
+                  <p className="text-[10px] text-slate-400">Use signal alignment, confidence, RSI, and noise filters before placing anything.</p>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-slate-950/35 p-2">
+                  <p className="text-[10px] uppercase tracking-[0.16em] text-slate-400">4. Trigger</p>
+                  <p className="mt-1 text-xs font-semibold text-slate-100">
+                    {autoEntryMode === "LIMIT_SR" ? "BUY_LIMIT / SELL_LIMIT" : "Market execution"}
+                  </p>
+                  <p className="text-[10px] text-slate-400">The executor waits for a better pullback price instead of chasing the move.</p>
+                </div>
+              </div>
+            </div>
             <div className="grid md:grid-cols-2 xl:grid-cols-4 gap-2">
               {panelSymbols.map((symbol, i) => {
                 const timeframe = panelTimeframes[i] || "D1";
                 const panelKey = `${symbol}|${timeframe}`;
+                const panelEntryMode = resolvePanelEntryMode(symbol, timeframe);
                 const diag = policyByPanel[panelKey];
                 const eligibility = autoEligibilityByPanel[panelKey];
+                const panelStrategy = panelStrategyIndicators[panelKey];
+                const panelData = panelAnalysis[panelKey];
+                const biasSignal = panelStrategy?.trendBias || null;
+                const setupSignal = panelStrategy?.setupSignal?.signal || "HOLD";
+                const entrySignal = panelStrategy?.entrySignal?.signal || "HOLD";
+                const structureData = panelStrategy?.entryData || panelData?.priceData || panelStrategy?.trendData || null;
+                const supportLabel = structureData ? formatSetupPrice(symbol, structureData.supportLevel) : "--";
+                const resistanceLabel = structureData ? formatSetupPrice(symbol, structureData.resistanceLevel) : "--";
+                const structureLabel =
+                  biasSignal === "BUY"
+                    ? "Buy support"
+                    : biasSignal === "SELL"
+                    ? "Sell resistance"
+                    : "Wait for bias";
+                const pendingOrderLabel =
+                  panelEntryMode === "LIMIT_SR"
+                    ? biasSignal === "BUY"
+                      ? "BUY_LIMIT"
+                      : biasSignal === "SELL"
+                      ? "SELL_LIMIT"
+                      : "PENDING"
+                    : biasSignal === "BUY"
+                    ? "BUY MARKET"
+                    : biasSignal === "SELL"
+                    ? "SELL MARKET"
+                    : "WAIT";
+                const setupNarrative =
+                  biasSignal === "BUY"
+                    ? `Follow ${AUTO_BIAS_TIMEFRAME} BUY bias, look for pullback into support, confirm on ${AUTO_SETUP_TIMEFRAME}/${autoEntryTimeframe}, then place ${pendingOrderLabel}.`
+                    : biasSignal === "SELL"
+                    ? `Follow ${AUTO_BIAS_TIMEFRAME} SELL bias, wait near resistance, confirm on ${AUTO_SETUP_TIMEFRAME}/${autoEntryTimeframe}, then place ${pendingOrderLabel}.`
+                    : `No clear ${AUTO_BIAS_TIMEFRAME} edge yet. The panel stays defensive until direction and setup agree.`;
                 const headlessAdvisory =
                   isHeadlessMode &&
-                  (normalizeSymbol(symbol) !== normalizeSymbol(HEADLESS_GOLD_PRESET_SYMBOL) ||
-                    timeframe !== HEADLESS_GOLD_PRESET_TIMEFRAME);
+                  !HEADLESS_MANAGED_PRESET.some(
+                    (item) => normalizeSymbol(symbol) === normalizeSymbol(item.symbol) && timeframe === item.timeframe
+                  );
                 const panelBlocked = eligibility !== undefined ? !eligibility.eligible : diag?.pass === false;
                 const panelPass = eligibility !== undefined ? eligibility.eligible : diag?.pass === true;
                 const failedCheck = diag?.checks?.find((check) => !check.ok);
                 return (
-                  <div key={`policy-${panelKey}-${i}`} className="rounded border border-slate-700 bg-slate-900/60 p-2">
+                  <div key={`policy-${panelKey}-${i}`} className={`rounded-xl border p-2 shadow-[0_10px_30px_rgba(2,6,23,0.24)] ${headlessAdvisory ? "border-amber-400/30 bg-[linear-gradient(135deg,rgba(120,53,15,0.12),rgba(15,23,42,0.92))]" : getSetupCardClass(biasSignal)}`}>
                     <div className="flex items-center justify-between mb-1">
                       <p className="text-xs font-semibold text-slate-100">
                         {formatPairLabel(symbol)} {timeframe}
@@ -8353,9 +9582,37 @@ const TradingAssistant: React.FC<TradingAssistantProps> = ({ trades }) => {
                     </p>
                     {headlessAdvisory ? (
                       <p className="text-[11px] mb-1 text-amber-300">
-                        Headless runtime executes {HEADLESS_GOLD_PRESET_SYMBOL} {HEADLESS_GOLD_PRESET_TIMEFRAME} only. This panel is diagnostics only.
+                        Headless runtime executes {HEADLESS_MANAGED_PRESET.map((item) => `${item.symbol} ${item.timeframe}`).join(" + ")}. This panel is diagnostics only.
                       </p>
                     ) : null}
+                    <div className="mb-2 rounded-lg border border-white/10 bg-slate-950/35 p-2">
+                      <div className="flex flex-wrap gap-1.5">
+                        <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${getSetupBadgeClass(biasSignal)}`}>
+                          {AUTO_BIAS_TIMEFRAME} {biasSignal || "WAIT"}
+                        </span>
+                        <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${getSetupBadgeClass(setupSignal)}`}>
+                          {AUTO_SETUP_TIMEFRAME} {setupSignal}
+                        </span>
+                        <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${getSetupBadgeClass(entrySignal)}`}>
+                          {autoEntryTimeframe} {entrySignal}
+                        </span>
+                        <span className="rounded-full border border-amber-300/25 bg-amber-300/10 px-2 py-0.5 text-[10px] font-semibold text-amber-100">
+                          {pendingOrderLabel}
+                        </span>
+                      </div>
+                      <div className="mt-2 grid grid-cols-2 gap-2 text-[10px]">
+                        <div className="rounded-md border border-white/10 bg-slate-900/55 p-2">
+                          <p className="uppercase tracking-[0.14em] text-slate-500">Zone</p>
+                          <p className={`mt-1 text-xs font-semibold ${getSetupBiasTone(biasSignal)}`}>{structureLabel}</p>
+                        </div>
+                        <div className="rounded-md border border-white/10 bg-slate-900/55 p-2">
+                          <p className="uppercase tracking-[0.14em] text-slate-500">Levels</p>
+                          <p className="mt-1 text-xs text-slate-200">S {supportLabel}</p>
+                          <p className="text-xs text-slate-200">R {resistanceLabel}</p>
+                        </div>
+                      </div>
+                      <p className="mt-2 text-[11px] text-slate-300">{setupNarrative}</p>
+                    </div>
                     {eligibility?.scalpBias && autoStrategyMode === "SCALP_M15" && (
                       <p className="text-[11px] mb-1">
                         <span className="text-slate-400">M15 Bias: </span>

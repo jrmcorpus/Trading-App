@@ -133,7 +133,7 @@ It will export CSV candles to your MT4 `MQL4/Files` folder.
 
 4. Start bridge:
 ```bash
-npm run market-bridge
+c
 ```
 
 5. In another terminal, run app:
